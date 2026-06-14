@@ -48,6 +48,7 @@ const microphoneSelect = document.getElementById("microphoneSelect");
 
 const settingsToggle = document.getElementById("settingsToggle");
 const settingsDiv = document.querySelector(".settings");
+const copyButton = document.getElementById("copyTranscript");
 
 // if (isExtension) {
 //   chrome.runtime.onInstalled.addListener((details) => {
@@ -242,6 +243,9 @@ function setupWebSocket() {
               true
             );
           }
+          if (linesTranscriptDiv.innerText.trim().length > 0) {
+            copyButton.style.display = "";
+          }
         }
       } else {
         statusText.textContent = "Disconnected from the WebSocket server. (Check logs if model is loading.)";
@@ -297,6 +301,9 @@ function setupWebSocket() {
         }
         statusText.textContent = "Finished processing audio! Ready to record again.";
         recordButton.disabled = false;
+        if (linesTranscriptDiv.innerText.trim().length > 0) {
+          copyButton.style.display = "";
+        }
 
         if (websocket) {
           websocket.close();
@@ -724,6 +731,7 @@ async function stopRecording() {
 
 async function toggleRecording() {
   if (!isRecording) {
+    copyButton.style.display = "none";
     if (waitingForStop) {
       console.log("Waiting for stop, early return");
       return;
@@ -796,6 +804,22 @@ navigator.mediaDevices.addEventListener('devicechange', async () => {
 settingsToggle.addEventListener("click", () => {
 settingsDiv.classList.toggle("visible");
 settingsToggle.classList.toggle("active");
+});
+
+copyButton.addEventListener("click", async () => {
+  const textContent = linesTranscriptDiv.innerText.trim();
+  if (!textContent) return;
+  try {
+    await navigator.clipboard.writeText(textContent);
+    copyButton.title = "Copied!";
+    copyButton.classList.add("copied");
+    setTimeout(() => {
+      copyButton.title = "Copy transcript to clipboard";
+      copyButton.classList.remove("copied");
+    }, 2000);
+  } catch (err) {
+    console.error("Failed to copy transcript:", err);
+  }
 });
 
 if (isExtension) {

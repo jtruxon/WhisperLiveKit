@@ -54,6 +54,9 @@ def get_inline_ui_html():
         with resources.files('whisperlivekit.web').joinpath('src', 'settings.svg').open('r', encoding='utf-8') as f:
             settings = f.read()
             settings_uri = f"data:image/svg+xml;base64,{base64.b64encode(settings.encode('utf-8')).decode('utf-8')}"
+        with resources.files('whisperlivekit.web').joinpath('src', 'clipboard.svg').open('r', encoding='utf-8') as f:
+            clipboard_svg = f.read()
+            clipboard_uri = f"data:image/svg+xml;base64,{base64.b64encode(clipboard_svg.encode('utf-8')).decode('utf-8')}"
 
         # Replace external references
         html_content = html_content.replace(
@@ -85,6 +88,11 @@ def get_inline_ui_html():
         html_content = html_content.replace(
             '<img src="web/src/settings.svg" alt="Settings" />',
             f'<img src="{settings_uri}" alt="" />'
+        )
+
+        html_content = html_content.replace(
+            '<img src="src/clipboard.svg" alt="Copy" width="20" height="20" />',
+            f'<img src="{clipboard_uri}" alt="Copy" width="20" height="20" />'
         )
 
         return html_content
