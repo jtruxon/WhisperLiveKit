@@ -32,6 +32,170 @@ const configReady = new Promise((r) => (configReadyResolve = r));
 let outputAudioContext = null;
 let audioSource = null;
 
+// --- History & Audio Recording ---
+let mp3EncoderWorker = null;
+let pendingAudioSave = null;
+let recordingStartTime = null;
+let webmChunksForHistory = [];
+let historyAudio = null;
+let historyAnimFrame = null;
+let currentHistoryDetailId = null;
+
+// --- History Store (IndexedDB + localStorage) ---
+const historyStore = {
+  DB_NAME: 'WhisperLiveKitHistory',
+  DB_VERSION: 1,
+  STORE_NAME: 'audioBlobs',
+  INDEX_KEY: 'wlk_history_index',
+  db: null,
+
+  async init() {
+    try {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open(this.DB_NAME, this.DB_VERSION);
+        request.onupgradeneeded = (e) => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains(this.STORE_NAME)) {
+            db.createObjectStore(this.STORE_NAME, { keyPath: 'id' });
+          }
+        };
+        request.onsuccess = (e) => {
+          this.db = e.target.result;
+          resolve();
+        };
+        request.onerror = (e) => {
+          console.warn('IndexedDB open failed:', e);
+          resolve(); // don't break app
+        };
+      });
+    } catch (err) {
+      console.warn('historyStore.init error:', err);
+    }
+  },
+
+  async save(entry, blob) {
+    try {
+      // Save metadata to localStorage
+      const index = this._getIndex();
+      index.unshift(entry.id);
+      localStorage.setItem(this.INDEX_KEY, JSON.stringify(index));
+      localStorage.setItem('wlk_history_' + entry.id, JSON.stringify(entry));
+
+      // Save audio blob to IndexedDB
+      if (this.db && blob) {
+        return new Promise((resolve) => {
+          try {
+            const tx = this.db.transaction(this.STORE_NAME, 'readwrite');
+            const store = tx.objectStore(this.STORE_NAME);
+            store.put({ id: entry.id, blob: blob });
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => { console.warn('IDB save error'); resolve(); };
+          } catch (err) {
+            console.warn('IDB save error:', err);
+            resolve();
+          }
+        });
+      }
+    } catch (err) {
+      console.warn('historyStore.save error:', err);
+    }
+  },
+
+  list() {
+    try {
+      const index = this._getIndex();
+      const entries = [];
+      for (const id of index) {
+        const raw = localStorage.getItem('wlk_history_' + id);
+        if (raw) {
+          try { entries.push(JSON.parse(raw)); } catch (e) { /* skip corrupt */ }
+        }
+      }
+      return entries;
+    } catch (err) {
+      console.warn('historyStore.list error:', err);
+      return [];
+    }
+  },
+
+  async getAudio(id) {
+    if (!this.db) return null;
+    try {
+      return new Promise((resolve) => {
+        const tx = this.db.transaction(this.STORE_NAME, 'readonly');
+        const store = tx.objectStore(this.STORE_NAME);
+        const req = store.get(id);
+        req.onsuccess = () => resolve(req.result ? req.result.blob : null);
+        req.onerror = () => resolve(null);
+      });
+    } catch (err) {
+      console.warn('historyStore.getAudio error:', err);
+      return null;
+    }
+  },
+
+  async delete(id) {
+    try {
+      // Remove from localStorage
+      const index = this._getIndex().filter(i => i !== id);
+      localStorage.setItem(this.INDEX_KEY, JSON.stringify(index));
+      localStorage.removeItem('wlk_history_' + id);
+
+      // Remove from IndexedDB
+      if (this.db) {
+        return new Promise((resolve) => {
+          try {
+            const tx = this.db.transaction(this.STORE_NAME, 'readwrite');
+            const store = tx.objectStore(this.STORE_NAME);
+            store.delete(id);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => resolve();
+          } catch (err) {
+            resolve();
+          }
+        });
+      }
+    } catch (err) {
+      console.warn('historyStore.delete error:', err);
+    }
+  },
+
+  async clearAll() {
+    try {
+      const index = this._getIndex();
+      for (const id of index) {
+        localStorage.removeItem('wlk_history_' + id);
+      }
+      localStorage.removeItem(this.INDEX_KEY);
+
+      if (this.db) {
+        return new Promise((resolve) => {
+          try {
+            const tx = this.db.transaction(this.STORE_NAME, 'readwrite');
+            const store = tx.objectStore(this.STORE_NAME);
+            store.clear();
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => resolve();
+          } catch (err) {
+            resolve();
+          }
+        });
+      }
+    } catch (err) {
+      console.warn('historyStore.clearAll error:', err);
+    }
+  },
+
+  _getIndex() {
+    try {
+      const raw = localStorage.getItem(this.INDEX_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+      return [];
+    }
+  }
+};
+
 waveCanvas.width = 60 * (window.devicePixelRatio || 1);
 waveCanvas.height = 30 * (window.devicePixelRatio || 1);
 waveCtx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
@@ -246,6 +410,8 @@ function setupWebSocket() {
           if (linesTranscriptDiv.innerText.trim().length > 0) {
             copyButton.style.display = "";
           }
+          // Save to history (fallback if ready_to_stop wasn't received)
+          saveRecordingToHistory();
         }
       } else {
         statusText.textContent = "Disconnected from the WebSocket server. (Check logs if model is loading.)";
@@ -304,6 +470,9 @@ function setupWebSocket() {
         if (linesTranscriptDiv.innerText.trim().length > 0) {
           copyButton.style.display = "";
         }
+
+        // --- Save to history ---
+        saveRecordingToHistory();
 
         if (websocket) {
           websocket.close();
@@ -577,6 +746,15 @@ async function startRecording() {
     microphone = audioContext.createMediaStreamSource(stream);
     microphone.connect(analyser);
 
+    // Initialize MP3/WAV encoder worker for history recording
+    try {
+      mp3EncoderWorker = new Worker("/web/mp3_encoder_worker.js");
+      mp3EncoderWorker.postMessage({ command: 'init', sampleRate: audioContext.sampleRate });
+    } catch (encErr) {
+      console.warn('Could not initialize encoder worker:', encErr);
+      mp3EncoderWorker = null;
+    }
+
     if (serverUseAudioWorklet) {
       if (!audioContext.audioWorklet) {
         throw new Error("AudioWorklet is not supported in this browser");
@@ -602,6 +780,13 @@ async function startRecording() {
       workletNode.port.onmessage = (e) => {
         const data = e.data;
         const ab = data instanceof ArrayBuffer ? data : data.buffer;
+
+        // Fork: copy buffer for WAV encoding (before transfer neuters it)
+        if (mp3EncoderWorker) {
+          const copy = ab.slice(0);
+          mp3EncoderWorker.postMessage({ command: 'encode', buffer: copy }, [copy]);
+        }
+
         recorderWorker.postMessage(
           {
             command: "record",
@@ -616,9 +801,16 @@ async function startRecording() {
       } catch (e) {
         recorder = new MediaRecorder(stream);
       }
+
+      // Collect WebM chunks for history (MediaRecorder path)
+      webmChunksForHistory = [];
+
       recorder.ondataavailable = (e) => {
-        if (websocket && websocket.readyState === WebSocket.OPEN) {
-          if (e.data && e.data.size > 0) {
+        if (e.data && e.data.size > 0) {
+          // Fork: collect chunks for history
+          webmChunksForHistory.push(e.data.slice(0));
+
+          if (websocket && websocket.readyState === WebSocket.OPEN) {
             websocket.send(e.data);
           }
         }
@@ -626,6 +818,7 @@ async function startRecording() {
       recorder.start(chunkDuration);
     }
 
+    recordingStartTime = Date.now();
     startTime = Date.now();
     timerInterval = setInterval(updateTimer, 1000);
     drawWaveform();
@@ -644,6 +837,11 @@ async function startRecording() {
 }
 
 async function stopRecording() {
+  // Capture recording duration before resetting startTime
+  const recordingDuration = recordingStartTime
+    ? Math.floor((Date.now() - recordingStartTime) / 1000)
+    : 0;
+
   if (wakeLock) {
     try {
       await wakeLock.release();
@@ -660,6 +858,25 @@ async function stopRecording() {
     const emptyBlob = new Blob([], { type: "audio/webm" });
     websocket.send(emptyBlob);
     statusText.textContent = "Recording stopped. Processing final audio...";
+  }
+
+  // Flush the encoder worker for AudioWorklet path
+  if (mp3EncoderWorker && serverUseAudioWorklet) {
+    pendingAudioSave = new Promise((resolve) => {
+      mp3EncoderWorker.onmessage = (ev) => {
+        if (ev.data && ev.data.type === 'mp3') {
+          resolve({ blob: ev.data.blob, duration: recordingDuration });
+        }
+      };
+      mp3EncoderWorker.postMessage({ command: 'flush' });
+    });
+  }
+
+  // For MediaRecorder path, store WebM chunks directly
+  if (!serverUseAudioWorklet && webmChunksForHistory.length > 0) {
+    const webmBlob = new Blob(webmChunksForHistory, { type: 'audio/webm' });
+    pendingAudioSave = Promise.resolve({ blob: webmBlob, duration: recordingDuration });
+    webmChunksForHistory = [];
   }
 
   if (recorder) {
@@ -724,9 +941,60 @@ async function stopRecording() {
   }
   timerElement.textContent = "00:00";
   startTime = null;
+  recordingStartTime = null;
 
   isRecording = false;
   updateUI();
+}
+
+// --- Save Recording to History ---
+async function saveRecordingToHistory() {
+  try {
+    if (!pendingAudioSave) return;
+
+    const { blob, duration } = await pendingAudioSave;
+    pendingAudioSave = null;
+
+    // Don't save if no transcript content
+    const plainText = linesTranscriptDiv ? linesTranscriptDiv.innerText.trim() : '';
+    if (!plainText && !blob) return;
+
+    const now = Date.now();
+    const id = 'rec_' + now + '_' + Math.random().toString(16).slice(2, 6);
+    const dateStr = new Date(now).toLocaleString(undefined, {
+      month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
+    });
+
+    const entry = {
+      id: id,
+      createdAt: now,
+      duration: duration || 0,
+      title: 'Recording — ' + dateStr,
+      plainText: plainText,
+      lines: lastReceivedData ? (lastReceivedData.lines || []) : [],
+      audioRef: id
+    };
+
+    await historyStore.save(entry, blob);
+    console.log('Recording saved to history:', id);
+
+    // Clean up encoder worker
+    if (mp3EncoderWorker) {
+      mp3EncoderWorker.terminate();
+      mp3EncoderWorker = null;
+    }
+
+    // Update history panel if open
+    if (document.getElementById('historyPanel').classList.contains('visible')) {
+      renderHistoryList();
+    }
+  } catch (err) {
+    console.warn('Failed to save recording to history:', err);
+    if (mp3EncoderWorker) {
+      mp3EncoderWorker.terminate();
+      mp3EncoderWorker = null;
+    }
+  }
 }
 
 async function toggleRecording() {
@@ -790,6 +1058,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   } catch (error) {
     console.log("Could not enumerate microphones on load:", error);
   }
+  // Initialize history store
+  try {
+    await historyStore.init();
+  } catch (error) {
+    console.log("Could not initialize history store:", error);
+  }
+  // Set up history panel event listeners
+  initHistoryPanel();
 });
 navigator.mediaDevices.addEventListener('devicechange', async () => {
   console.log('Device change detected, re-enumerating microphones');
@@ -851,4 +1127,351 @@ if (isExtension) {
   }
 
   void checkAndRequestPermissions();
+}
+
+// ===== History Panel UI Logic =====
+
+function initHistoryPanel() {
+  const historyToggle = document.getElementById('historyToggle');
+  const historyBack = document.getElementById('historyBack');
+  const historyClearAll = document.getElementById('historyClearAll');
+  const historyDetailBack = document.getElementById('historyDetailBack');
+  const historyDetailCopy = document.getElementById('historyDetailCopy');
+  const historyDetailDelete = document.getElementById('historyDetailDelete');
+  const historyPlayBtn = document.getElementById('historyPlayBtn');
+  const historySeekBar = document.getElementById('historySeekBar');
+
+  if (historyToggle) {
+    historyToggle.addEventListener('click', toggleHistoryPanel);
+  }
+  if (historyBack) {
+    historyBack.addEventListener('click', closeHistoryPanel);
+  }
+  if (historyClearAll) {
+    historyClearAll.addEventListener('click', clearAllHistory);
+  }
+  if (historyDetailBack) {
+    historyDetailBack.addEventListener('click', closeHistoryDetail);
+  }
+  if (historyDetailCopy) {
+    historyDetailCopy.addEventListener('click', () => {
+      const entry = getHistoryEntry(currentHistoryDetailId);
+      if (entry) {
+        copyHistoryText(entry.plainText, historyDetailCopy);
+      }
+    });
+  }
+  if (historyDetailDelete) {
+    historyDetailDelete.addEventListener('click', () => {
+      if (currentHistoryDetailId) {
+        deleteHistoryEntry(currentHistoryDetailId);
+      }
+    });
+  }
+  if (historyPlayBtn) {
+    historyPlayBtn.addEventListener('click', toggleHistoryPlayback);
+  }
+  if (historySeekBar) {
+    historySeekBar.addEventListener('input', (e) => {
+      seekHistoryAudio(parseFloat(e.target.value));
+    });
+  }
+}
+
+function toggleHistoryPanel() {
+  const panel = document.getElementById('historyPanel');
+  const toggle = document.getElementById('historyToggle');
+  if (!panel) return;
+
+  const isVisible = panel.classList.contains('visible');
+  if (isVisible) {
+    closeHistoryPanel();
+  } else {
+    panel.classList.add('visible');
+    if (toggle) toggle.classList.add('active');
+    renderHistoryList();
+  }
+}
+
+function closeHistoryPanel() {
+  const panel = document.getElementById('historyPanel');
+  const toggle = document.getElementById('historyToggle');
+  const detail = document.getElementById('historyDetail');
+
+  if (detail) detail.classList.remove('visible');
+  if (panel) panel.classList.remove('visible');
+  if (toggle) toggle.classList.remove('active');
+
+  stopHistoryPlayback();
+  currentHistoryDetailId = null;
+}
+
+function renderHistoryList() {
+  const listEl = document.getElementById('historyList');
+  const emptyEl = document.querySelector('.history-empty');
+  if (!listEl) return;
+
+  const entries = historyStore.list();
+
+  if (entries.length === 0) {
+    listEl.innerHTML = '';
+    if (emptyEl) emptyEl.classList.add('visible');
+    return;
+  }
+
+  if (emptyEl) emptyEl.classList.remove('visible');
+
+  listEl.innerHTML = entries.map(entry => {
+    const dateStr = new Date(entry.createdAt).toLocaleString(undefined, {
+      month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
+    });
+    const durMin = Math.floor((entry.duration || 0) / 60);
+    const durSec = (entry.duration || 0) % 60;
+    const durStr = durMin + ':' + durSec.toString().padStart(2, '0');
+    const preview = (entry.plainText || '').substring(0, 120) || 'No transcript';
+
+    return `<div class="history-item" data-id="${entry.id}">
+      <div class="history-item-header">
+        <span class="history-item-title">${escapeHtml(entry.title || dateStr)}</span>
+        <span class="history-item-duration">${durStr}</span>
+      </div>
+      <div class="history-item-preview">${escapeHtml(preview)}</div>
+      <div class="history-item-actions">
+        <button class="history-item-btn history-item-copy" title="Copy transcript" data-id="${entry.id}">
+          <img src="src/clipboard.svg" alt="Copy" width="16" height="16" />
+        </button>
+        <button class="history-item-btn history-item-delete" title="Delete" data-id="${entry.id}">
+          <img src="src/trash.svg" alt="Delete" width="16" height="16" />
+        </button>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Attach event listeners
+  listEl.querySelectorAll('.history-item').forEach(item => {
+    item.addEventListener('click', (e) => {
+      // Don't open detail if clicking action buttons
+      if (e.target.closest('.history-item-btn')) return;
+      openHistoryDetail(item.dataset.id);
+    });
+  });
+
+  listEl.querySelectorAll('.history-item-copy').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      const entry = getHistoryEntry(id);
+      if (entry) {
+        copyHistoryText(entry.plainText, btn);
+      }
+    });
+  });
+
+  listEl.querySelectorAll('.history-item-delete').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteHistoryEntry(btn.dataset.id);
+    });
+  });
+}
+
+function getHistoryEntry(id) {
+  try {
+    const raw = localStorage.getItem('wlk_history_' + id);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function openHistoryDetail(id) {
+  const detail = document.getElementById('historyDetail');
+  const titleEl = document.getElementById('historyDetailTitle');
+  const transcriptEl = document.getElementById('historyDetailTranscript');
+  if (!detail) return;
+
+  currentHistoryDetailId = id;
+  const entry = getHistoryEntry(id);
+  if (!entry) return;
+
+  if (titleEl) titleEl.textContent = entry.title || 'Recording';
+
+  // Render transcript
+  if (transcriptEl) {
+    if (entry.lines && entry.lines.length > 0) {
+      transcriptEl.innerHTML = entry.lines
+        .filter(line => line.speaker !== -2 && line.speaker !== 0)
+        .map(line => `<p>${escapeHtml(line.text || '')}</p>`)
+        .join('');
+    } else {
+      transcriptEl.innerHTML = `<p>${escapeHtml(entry.plainText || 'No transcript')}</p>`;
+    }
+  }
+
+  // Reset player state
+  const seekBar = document.getElementById('historySeekBar');
+  const timeDisplay = document.getElementById('historyTimeDisplay');
+  const playBtn = document.getElementById('historyPlayBtn');
+  if (seekBar) seekBar.value = 0;
+  if (timeDisplay) timeDisplay.textContent = '0:00 / ' + formatDuration(entry.duration || 0);
+  if (playBtn) {
+    playBtn.querySelector('.player-icon-play').style.display = '';
+    playBtn.querySelector('.player-icon-pause').style.display = 'none';
+  }
+
+  stopHistoryPlayback();
+  detail.classList.add('visible');
+}
+
+function closeHistoryDetail() {
+  const detail = document.getElementById('historyDetail');
+  if (detail) detail.classList.remove('visible');
+  stopHistoryPlayback();
+  currentHistoryDetailId = null;
+}
+
+async function deleteHistoryEntry(id) {
+  if (!confirm('Delete this recording?')) return;
+
+  await historyStore.delete(id);
+
+  // If we're in detail view for this entry, go back
+  if (currentHistoryDetailId === id) {
+    closeHistoryDetail();
+  }
+
+  renderHistoryList();
+}
+
+async function clearAllHistory() {
+  const entries = historyStore.list();
+  if (entries.length === 0) return;
+  if (!confirm('Delete all ' + entries.length + ' recording(s)?')) return;
+
+  await historyStore.clearAll();
+  closeHistoryDetail();
+  renderHistoryList();
+}
+
+// --- Per-Item Copy ---
+function copyHistoryText(text, buttonElement) {
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(() => {
+    buttonElement.classList.add('copied');
+    setTimeout(() => buttonElement.classList.remove('copied'), 1500);
+  }).catch(err => {
+    console.error('Failed to copy:', err);
+  });
+}
+
+// --- Audio Playback ---
+async function toggleHistoryPlayback() {
+  if (historyAudio && !historyAudio.paused) {
+    historyAudio.pause();
+    updatePlayPauseIcon(false);
+    cancelAnimationFrame(historyAnimFrame);
+    return;
+  }
+
+  if (historyAudio && historyAudio.src) {
+    historyAudio.play();
+    updatePlayPauseIcon(true);
+    updateSeekBar();
+    return;
+  }
+
+  // Load audio from IndexedDB
+  if (!currentHistoryDetailId) return;
+  const blob = await historyStore.getAudio(currentHistoryDetailId);
+  if (!blob) {
+    console.warn('No audio blob found for', currentHistoryDetailId);
+    return;
+  }
+
+  const url = URL.createObjectURL(blob);
+  historyAudio = new Audio(url);
+  historyAudio._objectUrl = url;
+
+  historyAudio.addEventListener('ended', () => {
+    updatePlayPauseIcon(false);
+    cancelAnimationFrame(historyAnimFrame);
+    const seekBar = document.getElementById('historySeekBar');
+    if (seekBar) seekBar.value = 100;
+  });
+
+  historyAudio.addEventListener('loadedmetadata', () => {
+    const timeDisplay = document.getElementById('historyTimeDisplay');
+    if (timeDisplay) {
+      timeDisplay.textContent = '0:00 / ' + formatDuration(Math.floor(historyAudio.duration));
+    }
+  });
+
+  try {
+    await historyAudio.play();
+    updatePlayPauseIcon(true);
+    updateSeekBar();
+  } catch (err) {
+    console.error('Playback failed:', err);
+  }
+}
+
+function seekHistoryAudio(position) {
+  if (!historyAudio || !historyAudio.duration) return;
+  historyAudio.currentTime = (position / 100) * historyAudio.duration;
+}
+
+function stopHistoryPlayback() {
+  if (historyAudio) {
+    historyAudio.pause();
+    if (historyAudio._objectUrl) {
+      URL.revokeObjectURL(historyAudio._objectUrl);
+    }
+    historyAudio = null;
+  }
+  if (historyAnimFrame) {
+    cancelAnimationFrame(historyAnimFrame);
+    historyAnimFrame = null;
+  }
+  updatePlayPauseIcon(false);
+}
+
+function updatePlayPauseIcon(isPlaying) {
+  const playBtn = document.getElementById('historyPlayBtn');
+  if (!playBtn) return;
+  const playIcon = playBtn.querySelector('.player-icon-play');
+  const pauseIcon = playBtn.querySelector('.player-icon-pause');
+  if (playIcon) playIcon.style.display = isPlaying ? 'none' : '';
+  if (pauseIcon) pauseIcon.style.display = isPlaying ? '' : 'none';
+}
+
+function updateSeekBar() {
+  if (!historyAudio || historyAudio.paused) return;
+
+  const seekBar = document.getElementById('historySeekBar');
+  const timeDisplay = document.getElementById('historyTimeDisplay');
+
+  if (seekBar && historyAudio.duration) {
+    seekBar.value = (historyAudio.currentTime / historyAudio.duration) * 100;
+  }
+  if (timeDisplay && historyAudio.duration) {
+    timeDisplay.textContent =
+      formatDuration(Math.floor(historyAudio.currentTime)) +
+      ' / ' +
+      formatDuration(Math.floor(historyAudio.duration));
+  }
+
+  historyAnimFrame = requestAnimationFrame(updateSeekBar);
+}
+
+// --- Utility ---
+function formatDuration(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return m + ':' + s.toString().padStart(2, '0');
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
 }

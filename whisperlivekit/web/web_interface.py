@@ -27,6 +27,8 @@ def get_inline_ui_html():
             worklet_code = f.read()
         with resources.files('whisperlivekit.web').joinpath('recorder_worker.js').open('r', encoding='utf-8') as f:
             worker_code = f.read()
+        with resources.files('whisperlivekit.web').joinpath('mp3_encoder_worker.js').open('r', encoding='utf-8') as f:
+            encoder_worker_code = f.read()
 
         js_content = js_content.replace(
             'await audioContext.audioWorklet.addModule("/web/pcm_worklet.js");',
@@ -39,6 +41,12 @@ def get_inline_ui_html():
             'const workerBlob = new Blob([`' + worker_code + '`], { type: "application/javascript" });\n' +
             'const workerUrl = URL.createObjectURL(workerBlob);\n' +
             'recorderWorker = new Worker(workerUrl);'
+        )
+        js_content = js_content.replace(
+            'mp3EncoderWorker = new Worker("/web/mp3_encoder_worker.js");',
+            'const encoderBlob = new Blob([`' + encoder_worker_code + '`], { type: "application/javascript" });\n' +
+            'const encoderUrl = URL.createObjectURL(encoderBlob);\n' +
+            'mp3EncoderWorker = new Worker(encoderUrl);'
         )
 
         # SVG files
@@ -57,6 +65,23 @@ def get_inline_ui_html():
         with resources.files('whisperlivekit.web').joinpath('src', 'clipboard.svg').open('r', encoding='utf-8') as f:
             clipboard_svg = f.read()
             clipboard_uri = f"data:image/svg+xml;base64,{base64.b64encode(clipboard_svg.encode('utf-8')).decode('utf-8')}"
+
+        # New SVG files for history panel
+        with resources.files('whisperlivekit.web').joinpath('src', 'history.svg').open('r', encoding='utf-8') as f:
+            history_svg = f.read()
+            history_uri = f"data:image/svg+xml;base64,{base64.b64encode(history_svg.encode('utf-8')).decode('utf-8')}"
+        with resources.files('whisperlivekit.web').joinpath('src', 'play.svg').open('r', encoding='utf-8') as f:
+            play_svg = f.read()
+            play_uri = f"data:image/svg+xml;base64,{base64.b64encode(play_svg.encode('utf-8')).decode('utf-8')}"
+        with resources.files('whisperlivekit.web').joinpath('src', 'pause.svg').open('r', encoding='utf-8') as f:
+            pause_svg = f.read()
+            pause_uri = f"data:image/svg+xml;base64,{base64.b64encode(pause_svg.encode('utf-8')).decode('utf-8')}"
+        with resources.files('whisperlivekit.web').joinpath('src', 'trash.svg').open('r', encoding='utf-8') as f:
+            trash_svg = f.read()
+            trash_uri = f"data:image/svg+xml;base64,{base64.b64encode(trash_svg.encode('utf-8')).decode('utf-8')}"
+        with resources.files('whisperlivekit.web').joinpath('src', 'arrow_back.svg').open('r', encoding='utf-8') as f:
+            arrow_back_svg = f.read()
+            arrow_back_uri = f"data:image/svg+xml;base64,{base64.b64encode(arrow_back_svg.encode('utf-8')).decode('utf-8')}"
 
         # Replace external references
         html_content = html_content.replace(
@@ -93,6 +118,52 @@ def get_inline_ui_html():
         html_content = html_content.replace(
             '<img src="src/clipboard.svg" alt="Copy" width="20" height="20" />',
             f'<img src="{clipboard_uri}" alt="Copy" width="20" height="20" />'
+        )
+
+        # New history panel SVG replacements
+        html_content = html_content.replace(
+            '<img src="src/history.svg" alt="History" width="20" height="20" />',
+            f'<img src="{history_uri}" alt="History" width="20" height="20" />'
+        )
+
+        html_content = html_content.replace(
+            '<img src="src/arrow_back.svg" alt="Back" width="20" height="20" />',
+            f'<img src="{arrow_back_uri}" alt="Back" width="20" height="20" />'
+        )
+
+        html_content = html_content.replace(
+            '<img src="src/trash.svg" alt="Clear All" width="18" height="18" />',
+            f'<img src="{trash_uri}" alt="Clear All" width="18" height="18" />'
+        )
+
+        html_content = html_content.replace(
+            '<img src="src/play.svg" alt="Play" width="22" height="22"',
+            f'<img src="{play_uri}" alt="Play" width="22" height="22"'
+        )
+
+        html_content = html_content.replace(
+            '<img src="src/pause.svg" alt="Pause" width="22" height="22"',
+            f'<img src="{pause_uri}" alt="Pause" width="22" height="22"'
+        )
+
+        html_content = html_content.replace(
+            '<img src="src/clipboard.svg" alt="Copy" width="16" height="16" />',
+            f'<img src="{clipboard_uri}" alt="Copy" width="16" height="16" />'
+        )
+
+        html_content = html_content.replace(
+            '<img src="src/trash.svg" alt="Delete" width="16" height="16" />',
+            f'<img src="{trash_uri}" alt="Delete" width="16" height="16" />'
+        )
+
+        # Also replace SVG references in the inlined JS (used in renderHistoryList template literals)
+        html_content = html_content.replace(
+            'src="src/clipboard.svg"',
+            f'src="{clipboard_uri}"'
+        )
+        html_content = html_content.replace(
+            'src="src/trash.svg"',
+            f'src="{trash_uri}"'
         )
 
         return html_content
