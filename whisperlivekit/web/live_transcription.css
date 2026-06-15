@@ -366,11 +366,245 @@ body {
   display: inline;
 }
 
-.settings {
+/* ===== Phase 2E: Settings drawer =====
+   The drawer slides in from the top of the viewport, mirroring the
+   slide-over discipline used for the history panel (z-index slightly
+   higher so it sits above). Closed state is fully off-screen so it
+   doesn't intercept pointer events.
+*/
+.settings.settings-drawer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 220; /* above .history-detail (210) and panel-backdrop (190) */
+  max-height: 90vh;
+  overflow-y: auto;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  border-radius: 0 0 18px 18px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+  transform: translateY(-100%);
+  transition: transform 0.25s ease;
+  pointer-events: none;
+  visibility: hidden;
+  padding: 0;
+  display: block;
+}
+
+.settings.settings-drawer.open,
+.settings.settings-drawer.visible {
+  transform: translateY(0);
+  pointer-events: auto;
+  visibility: visible;
+}
+
+.settings-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 1;
+}
+
+.settings-drawer-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.settings-drawer-close {
+  background: transparent;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--text);
+  padding: 4px 10px;
+  border-radius: 8px;
+}
+
+.settings-drawer-close:hover {
+  background: var(--chip-bg);
+}
+
+.settings-drawer-body {
+  padding: 14px 18px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-section:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.settings-section-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text);
+  opacity: 0.75;
+}
+
+.settings-note {
+  margin: 0;
+  font-size: 12px;
+  opacity: 0.7;
+  color: var(--text);
+}
+
+.settings-pending {
+  font-size: 11px;
+  opacity: 0.6;
+  font-style: italic;
+  margin-left: 4px;
+}
+
+.field-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.field-readonly {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.field-readonly-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  color: var(--text);
+  opacity: 0.85;
+}
+
+.field-toggle {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.field-toggle label {
+  font-size: 14px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.field-aux {
+  font-size: 12px;
+  opacity: 0.7;
+  color: var(--text);
+}
+
+.segmented-text label {
+  padding: 4px 12px;
+  font-size: 13px;
+}
+
+.settings-action-row {
   display: flex;
   flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 12px;
+  gap: 8px;
+}
+
+.settings-action-btn {
+  background: var(--button-bg);
+  border: 1px solid var(--button-border);
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.settings-action-btn:hover:not(:disabled) {
+  background: var(--chip-bg);
+}
+
+.settings-action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.settings-action-btn-danger {
+  border-color: #c0392b;
+  color: #c0392b;
+}
+
+.settings-action-btn-danger:hover:not(:disabled) {
+  background: rgba(192, 57, 43, 0.08);
+}
+
+/* ===== Phase 2E: shortcuts dialog (placeholder body fills in 2G) ===== */
+.shortcuts-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 230;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.shortcuts-dialog[hidden] {
+  display: none;
+}
+
+.shortcuts-dialog-inner {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  max-width: 480px;
+  width: 100%;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+}
+
+.shortcuts-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.shortcuts-dialog-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.shortcuts-dialog-close {
+  background: transparent;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.shortcuts-dialog-body {
+  padding: 14px 16px 18px;
+  color: var(--text);
 }
 
 .settings-toggle {
@@ -436,20 +670,11 @@ body {
   opacity: 1;
 }
 
+/* Phase 2E: legacy `.settings` show/hide rules are obsolete — the drawer
+   handles its own open/closed transform. Keep `.settings-toggle` visible
+   at all viewports as before. */
 @media (max-width: 10000px) {
   .settings-toggle {
-    display: flex;
-  }
-  
-  .settings {
-    display: none;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 18px;
-    padding: 12px;
-  }
-  
-  .settings.visible {
     display: flex;
   }
 }
@@ -589,12 +814,20 @@ label {
   display: none;
 }
 
-/* Transcript area */
+/* Transcript area
+   Phase 2E: font-size is driven by the `--transcript-font-size` CSS
+   variable (set on :root by the Display section's slider). Default is
+   16 px, matching the previous hard-coded value.
+*/
+:root {
+  --transcript-font-size: 16px;
+}
+
 #linesTranscript {
   margin: 0 auto;
   max-width: 700px;
   text-align: left;
-  font-size: 16px;
+  font-size: var(--transcript-font-size);
 }
 
 #linesTranscript p {

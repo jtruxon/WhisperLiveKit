@@ -3,6 +3,8 @@ import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -34,6 +36,57 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _get_package_version() -> Optional[str]:
+    """Return the installed whisperlivekit version, or None if undeterminable."""
+    try:
+        return _pkg_version("whisperlivekit")
+    except PackageNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _build_config_message(mode: str) -> dict:
+    """Build the initial `config` message sent to a freshly-connected client.
+
+    Phase 2E adds optional ``backend``/``model``/``language``/``vad``/
+    ``diarization``/``version`` fields announcing how the server is
+    configured. The client treats every new field as optional so older
+    servers (which did not send them) keep working unchanged.
+    """
+    msg: dict = {
+        "type": "config",
+        "useAudioWorklet": bool(config.pcm_input),
+        "mode": mode,
+    }
+    # All new fields are best-effort: a missing/odd value is reported as
+    # null/false rather than raising.
+    try:
+        msg["backend"] = getattr(config, "backend", None) or None
+    except Exception:
+        msg["backend"] = None
+    try:
+        msg["model"] = getattr(config, "model_size", None) or None
+    except Exception:
+        msg["model"] = None
+    try:
+        lan = getattr(config, "lan", None) or None
+        msg["language"] = lan if lan else "auto"
+    except Exception:
+        msg["language"] = None
+    try:
+        msg["vad"] = bool(getattr(config, "vad", False))
+    except Exception:
+        msg["vad"] = False
+    try:
+        msg["diarization"] = bool(getattr(config, "diarization", False))
+    except Exception:
+        msg["diarization"] = False
+    msg["version"] = _get_package_version()
+    return msg
+
 
 @app.get("/")
 async def get():
@@ -93,7 +146,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("Client requested diff mode")
 
     try:
-        await websocket.send_json({"type": "config", "useAudioWorklet": bool(config.pcm_input), "mode": mode})
+        await websocket.send_json(_build_config_message(mode))
     except Exception as e:
         logger.warning(f"Failed to send config to client: {e}")
 

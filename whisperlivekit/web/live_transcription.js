@@ -529,6 +529,18 @@ function setupWebSocket() {
         statusText.textContent = serverUseAudioWorklet
           ? "Connected. Using AudioWorklet (PCM)."
           : "Connected. Using MediaRecorder (WebM).";
+        // Phase 2E: hand the message to the Settings drawer so its
+        // Transcription / About sections can render. All new fields
+        // (backend, model, language, vad, diarization, version) are
+        // optional — older servers won't send them and the drawer
+        // displays "—" defensively.
+        try {
+          if (typeof SettingsDrawer !== 'undefined' && SettingsDrawer && SettingsDrawer.applyServerConfig) {
+            SettingsDrawer.applyServerConfig(data);
+          }
+        } catch (err) {
+          console.warn('SettingsDrawer.applyServerConfig failed:', err);
+        }
         if (configReadyResolve) configReadyResolve();
         return;
       }
@@ -1204,9 +1216,19 @@ navigator.mediaDevices.addEventListener('devicechange', async () => {
 });
 
 
+// Phase 2E: settings toggle now opens the drawer module instead of the
+// legacy collapsible row. The actual show/hide logic lives in
+// SettingsDrawer (defined further below) so that all settings sections —
+// connection mode, font-size, history toggles, etc. — share one
+// open/close lifecycle hooked up to OverlayManager.
 settingsToggle.addEventListener("click", () => {
-settingsDiv.classList.toggle("visible");
-settingsToggle.classList.toggle("active");
+  if (typeof SettingsDrawer !== 'undefined' && SettingsDrawer && SettingsDrawer.toggle) {
+    SettingsDrawer.toggle();
+  } else {
+    // Defensive fallback: drawer module not initialized yet.
+    settingsDiv.classList.toggle("visible");
+    settingsToggle.classList.toggle("active");
+  }
 });
 
 copyButton.addEventListener("click", async () => {
@@ -1412,6 +1434,22 @@ const OverlayManager = (() => {
       closeHistoryPanel();
     } else if (top === 'toolbarOverflow') {
       ToolbarOverflow.close();
+    } else if (top === 'settings') {
+      // Phase 2E: settings drawer is just another overlay.
+      if (typeof SettingsDrawer !== 'undefined' && SettingsDrawer && SettingsDrawer.close) {
+        SettingsDrawer.close();
+      } else {
+        stack.pop();
+        _refreshBackdrop();
+      }
+    } else if (top === 'shortcutsDialog') {
+      const dlg = document.getElementById('shortcutsDialog');
+      if (dlg) {
+        dlg.hidden = true;
+        dlg.setAttribute('aria-hidden', 'true');
+      }
+      stack.pop();
+      _refreshBackdrop();
     } else {
       // Unknown overlay — pop defensively.
       stack.pop();
@@ -2281,3 +2319,372 @@ if (retranscribeBtn && retranscribeFileInput) {
 if (retranscribeCloseBtn) {
   retranscribeCloseBtn.addEventListener("click", _retranscribeHide);
 }
+
+// ===== Phase 2E: Settings helper =====
+//
+// All client-side preferences are persisted under `wlk_*` localStorage
+// keys. Settings.get / Settings.set wrap try/catch so private-mode
+// browsers (where localStorage throws) still work — they just don't
+// persist. Coercion is intentionally lenient: callers pass primitives
+// and we round-trip through JSON so booleans, numbers, and short strings
+// all behave consistently.
+const Settings = (() => {
+  function get(key, fallback) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw === null) return fallback;
+      try {
+        return JSON.parse(raw);
+      } catch (_) {
+        return raw;
+      }
+    } catch (e) {
+      return fallback;
+    }
+  }
+  function set(key, val) {
+    try {
+      localStorage.setItem(key, JSON.stringify(val));
+    } catch (e) { /* private mode — ignore */ }
+  }
+  return { get, set };
+})();
+
+// ===== Phase 2E: Settings drawer =====
+//
+// The drawer reuses 2B's overlay primitives (OverlayManager + backdrop +
+// Esc handler) — see CompactHeader, ToolbarOverflow for the same pattern.
+// Sections follow PHASE2_UI_DESIGN.md §6.2:
+//
+//   Connection / Audio / Transcription / Display / History / Privacy / About
+//
+// Display-only fields (server backend, model, etc.) are populated from
+// the expanded `config` message (Phase 2E.A). Older servers won't send
+// the new fields; the drawer falls back to "—" defensively.
+//
+// Several settings are persisted-only in 2E (their *effects* land in
+// later sub-phases — see the brief). Those controls call `console.info`
+// so it's traceable when a setting will start having a real effect.
+const SettingsDrawer = (() => {
+  const KEYS = {
+    connectionMode: 'wlk_connection_mode',           // 2I will read this
+    fontSize:       'wlk_font_size',                 // takes effect immediately
+    showTimestamps: 'wlk_show_timestamps',           // 2F will read this
+    autoSave:       'wlk_history_autosave',          // 2C-quota will read this
+    evictionPolicy: 'wlk_history_eviction',          // 2C-quota will read this
+    persistStorage: 'wlk_persist_storage',           // 2C-quota will read this
+    // compactHeader: reuses 2B's existing key (`wlk_compact_header_pinned_off`,
+    // inverse semantics — see CompactHeader.isPinnedOff()).
+  };
+  const DEFAULTS = {
+    connectionMode: 'full',
+    fontSize: 16,
+    showTimestamps: false,
+    autoSave: true,
+    evictionPolicy: 'manual',
+    persistStorage: false,
+  };
+  const FONT_SIZE_MIN = 14;
+  const FONT_SIZE_MAX = 20;
+
+  let lastFocused = null;
+  let initialized = false;
+
+  function _panel() { return document.getElementById('settingsPanel'); }
+  function _toggleBtn() { return document.getElementById('settingsToggle'); }
+
+  // ---------------------- Open / close lifecycle ----------------------
+
+  function isOpen() {
+    const p = _panel();
+    return !!(p && p.classList.contains('open'));
+  }
+
+  function open() {
+    const p = _panel();
+    const tb = _toggleBtn();
+    if (!p) return;
+    if (p.classList.contains('open')) return;
+    lastFocused = document.activeElement;
+    refreshDynamicReadouts();
+    p.classList.add('open');
+    p.setAttribute('aria-hidden', 'false');
+    if (tb) {
+      tb.classList.add('active');
+      tb.setAttribute('aria-expanded', 'true');
+    }
+    OverlayManager.push('settings');
+    // Move focus into the drawer for keyboard users (focus trap is 2G's job).
+    const closeBtn = document.getElementById('settingsClose');
+    if (closeBtn && typeof closeBtn.focus === 'function') {
+      try { closeBtn.focus({ preventScroll: true }); } catch (_) { closeBtn.focus(); }
+    }
+  }
+
+  function close() {
+    const p = _panel();
+    const tb = _toggleBtn();
+    if (!p) return;
+    if (!p.classList.contains('open')) return;
+    p.classList.remove('open');
+    p.setAttribute('aria-hidden', 'true');
+    if (tb) {
+      tb.classList.remove('active');
+      tb.setAttribute('aria-expanded', 'false');
+    }
+    OverlayManager.remove('settings');
+    if (lastFocused && typeof lastFocused.focus === 'function') {
+      try { lastFocused.focus({ preventScroll: true }); } catch (_) { lastFocused.focus(); }
+    }
+    lastFocused = null;
+  }
+
+  function toggle() {
+    if (isOpen()) close(); else open();
+  }
+
+  // ---------------------- Server config message ----------------------
+
+  function applyServerConfig(data) {
+    if (!data || typeof data !== 'object') return;
+    const dash = '—';
+    const get = (k) => (data[k] === undefined || data[k] === null || data[k] === '') ? dash : data[k];
+    const setText = (id, value) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = value;
+    };
+    setText('settingsLanguage',    get('language'));
+    setText('settingsBackend',     get('backend'));
+    setText('settingsModel',       get('model'));
+    setText('settingsVad',         (typeof data.vad === 'boolean') ? (data.vad ? 'On' : 'Off') : dash);
+    setText('settingsDiarization', (typeof data.diarization === 'boolean') ? (data.diarization ? 'On' : 'Off') : dash);
+    setText('settingsVersion',     get('version'));
+  }
+
+  // ---------------------- Dynamic readouts ----------------------
+
+  function refreshDynamicReadouts() {
+    // Sample rate (Audio section): only knowable once an AudioContext exists.
+    const srEl = document.getElementById('settingsSampleRate');
+    if (srEl) {
+      try {
+        if (typeof audioContext !== 'undefined' && audioContext && audioContext.sampleRate) {
+          srEl.textContent = audioContext.sampleRate + ' Hz';
+        } else {
+          srEl.textContent = '—';
+        }
+      } catch (_) {
+        srEl.textContent = '—';
+      }
+    }
+    // History count (History section).
+    const hcEl = document.getElementById('settingsHistoryCount');
+    if (hcEl) {
+      try {
+        const n = (typeof historyStore !== 'undefined' && historyStore && historyStore.list)
+          ? historyStore.list().length
+          : 0;
+        hcEl.textContent = String(n);
+      } catch (_) {
+        hcEl.textContent = '0';
+      }
+    }
+  }
+
+  // ---------------------- Wire up controls ----------------------
+
+  function _wireConnectionMode() {
+    const radios = document.querySelectorAll('input[name="wlk-connmode"]');
+    if (!radios.length) return;
+    const current = Settings.get(KEYS.connectionMode, DEFAULTS.connectionMode);
+    let matched = false;
+    radios.forEach(r => {
+      if (r.value === current) { r.checked = true; matched = true; }
+      r.addEventListener('change', () => {
+        if (!r.checked) return;
+        Settings.set(KEYS.connectionMode, r.value);
+        // Per the brief: do NOT alter WS URL building here — that's 2I.
+        // eslint-disable-next-line no-console
+        console.info('[wlk] connection mode persisted:', r.value,
+          '— takes effect after sub-phase 2I lands.');
+      });
+    });
+    if (!matched) {
+      const dflt = document.getElementById('connmode-full');
+      if (dflt) dflt.checked = true;
+    }
+  }
+
+  function _applyFontSize(px) {
+    const n = Math.max(FONT_SIZE_MIN, Math.min(FONT_SIZE_MAX, parseInt(px, 10) || DEFAULTS.fontSize));
+    document.documentElement.style.setProperty('--transcript-font-size', n + 'px');
+    const ro = document.getElementById('settingsFontSizeReadout');
+    if (ro) ro.textContent = n + ' px';
+    return n;
+  }
+
+  function _wireFontSize() {
+    const slider = document.getElementById('settingsFontSize');
+    if (!slider) return;
+    const stored = Settings.get(KEYS.fontSize, DEFAULTS.fontSize);
+    const initial = _applyFontSize(stored);
+    slider.value = String(initial);
+    slider.addEventListener('input', (e) => {
+      const n = _applyFontSize(e.target.value);
+      Settings.set(KEYS.fontSize, n);
+    });
+  }
+
+  function _wireShowTimestamps() {
+    const cb = document.getElementById('settingsShowTimestamps');
+    if (!cb) return;
+    cb.checked = !!Settings.get(KEYS.showTimestamps, DEFAULTS.showTimestamps);
+    cb.addEventListener('change', () => {
+      Settings.set(KEYS.showTimestamps, !!cb.checked);
+      // eslint-disable-next-line no-console
+      console.info('[wlk] show-timestamps persisted:', cb.checked,
+        '— rendering effect lands in sub-phase 2F.');
+    });
+  }
+
+  function _wireCompactHeaderToggle() {
+    // Reuses CompactHeader's existing storage key (`wlk_compact_header_pinned_off`,
+    // boolean-as-"1"). Inverse semantics: checkbox checked = compact ON,
+    // i.e. NOT pinned off. Do not introduce a duplicate key.
+    const cb = document.getElementById('settingsCompactHeader');
+    if (!cb) return;
+    const COMPAT_KEY = 'wlk_compact_header_pinned_off';
+    let pinnedOff = false;
+    try { pinnedOff = localStorage.getItem(COMPAT_KEY) === '1'; } catch (_) { /* ignore */ }
+    cb.checked = !pinnedOff;
+    cb.addEventListener('change', () => {
+      try {
+        if (cb.checked) {
+          // Compact mode allowed — clear the pinned-off flag.
+          localStorage.removeItem(COMPAT_KEY);
+        } else {
+          localStorage.setItem(COMPAT_KEY, '1');
+        }
+      } catch (_) { /* private mode — ignore */ }
+      // Reflect immediately on the document if the live recording state lets us.
+      try {
+        if (typeof CompactHeader !== 'undefined' && CompactHeader && CompactHeader.refresh) {
+          CompactHeader.refresh();
+        }
+      } catch (_) { /* CompactHeader.refresh is optional */ }
+    });
+  }
+
+  function _wireAutoSave() {
+    const cb = document.getElementById('settingsAutoSave');
+    if (!cb) return;
+    cb.checked = !!Settings.get(KEYS.autoSave, DEFAULTS.autoSave);
+    cb.addEventListener('change', () => {
+      Settings.set(KEYS.autoSave, !!cb.checked);
+      // eslint-disable-next-line no-console
+      console.info('[wlk] history auto-save persisted:', cb.checked,
+        '— enforcement lands in sub-phase 2C-quota.');
+    });
+  }
+
+  function _wireEvictionPolicy() {
+    // Disabled in 2E (display only). Persist initial value in case it was
+    // already stored, but do not enable the radios — see brief Q3.
+    const radios = document.querySelectorAll('input[name="wlk-eviction"]');
+    if (!radios.length) return;
+    const current = Settings.get(KEYS.evictionPolicy, DEFAULTS.evictionPolicy);
+    radios.forEach(r => {
+      if (r.value === current) r.checked = true;
+    });
+  }
+
+  function _wirePersistentStorage() {
+    const cb = document.getElementById('settingsPersistentStorage');
+    if (!cb) return;
+    cb.checked = !!Settings.get(KEYS.persistStorage, DEFAULTS.persistStorage);
+    cb.addEventListener('change', () => {
+      Settings.set(KEYS.persistStorage, !!cb.checked);
+      // eslint-disable-next-line no-console
+      console.info('[wlk] persistent-storage request persisted:', cb.checked,
+        '— actual navigator.storage.persist() call lands in 2C-quota.');
+    });
+  }
+
+  function _wirePrivacy() {
+    const clearBtn = document.getElementById('settingsClearAll');
+    if (clearBtn) {
+      clearBtn.addEventListener('click', () => {
+        // Reuse the existing clearAllHistory flow used by the panel's trash button.
+        try {
+          if (typeof clearAllHistory === 'function') {
+            clearAllHistory();
+          }
+        } catch (e) {
+          console.error('clearAllHistory failed:', e);
+        }
+      });
+    }
+    // Export-all is disabled until 2C-export — no listener needed.
+  }
+
+  function _wireShortcuts() {
+    const link = document.getElementById('settingsShortcuts');
+    const dlg = document.getElementById('shortcutsDialog');
+    const closeBtn = document.getElementById('shortcutsDialogClose');
+    if (link && dlg) {
+      link.addEventListener('click', () => {
+        dlg.hidden = false;
+        dlg.setAttribute('aria-hidden', 'false');
+        OverlayManager.push('shortcutsDialog');
+      });
+    }
+    if (closeBtn && dlg) {
+      closeBtn.addEventListener('click', () => {
+        dlg.hidden = true;
+        dlg.setAttribute('aria-hidden', 'true');
+        OverlayManager.remove('shortcutsDialog');
+      });
+    }
+  }
+
+  function _wireDrawerChrome() {
+    const closeBtn = document.getElementById('settingsClose');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', close);
+    }
+  }
+
+  // ---------------------- Init ----------------------
+
+  function init() {
+    if (initialized) return;
+    initialized = true;
+    // Apply persisted font-size *before* any paint happens, even if the
+    // drawer is never opened. Wiring the slider is fine to defer.
+    try {
+      const stored = Settings.get(KEYS.fontSize, DEFAULTS.fontSize);
+      _applyFontSize(stored);
+    } catch (_) { /* ignore */ }
+
+    _wireDrawerChrome();
+    _wireConnectionMode();
+    _wireFontSize();
+    _wireShowTimestamps();
+    _wireCompactHeaderToggle();
+    _wireAutoSave();
+    _wireEvictionPolicy();
+    _wirePersistentStorage();
+    _wirePrivacy();
+    _wireShortcuts();
+  }
+
+  return { init, open, close, toggle, isOpen, applyServerConfig, refreshDynamicReadouts };
+})();
+
+document.addEventListener('DOMContentLoaded', () => {
+  try {
+    SettingsDrawer.init();
+  } catch (e) {
+    console.warn('SettingsDrawer init failed:', e);
+  }
+});
