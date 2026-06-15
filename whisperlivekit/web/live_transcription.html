@@ -32,6 +32,17 @@
                     <img src="src/clipboard.svg" alt="Copy" width="20" height="20" />
                 </button>
 
+                <button id="downloadAudioBtn" class="header-button download-audio-btn" title="Download session audio" disabled>
+                    <span aria-hidden="true">⬇︎</span>
+                    <span class="btn-label">Audio</span>
+                </button>
+
+                <button id="retranscribeBtn" class="header-button retranscribe-btn" title="Re-transcribe an audio file">
+                    <span aria-hidden="true">↻</span>
+                    <span class="btn-label">Re-transcribe…</span>
+                </button>
+                <input id="retranscribeFileInput" type="file" accept="audio/*" style="display:none;" />
+
                 <button id="historyToggle" class="header-button history-toggle" title="Recording history">
                     <img src="src/history.svg" alt="History" width="20" height="20" />
                 </button>
@@ -79,6 +90,16 @@
 
     <div class="transcript-container">
         <div id="linesTranscript"></div>
+
+        <!-- Re-transcription result section (hidden until a file is processed) -->
+        <div id="retranscribeSection" class="retranscribe-section" style="display:none;">
+            <div class="retranscribe-section-header">
+                <span class="retranscribe-section-title">Re-transcription of <span id="retranscribeFileName"></span></span>
+                <button id="retranscribeCloseBtn" class="retranscribe-close-btn" title="Hide re-transcription result">×</button>
+            </div>
+            <div id="retranscribeStatus" class="retranscribe-status"></div>
+            <div id="retranscribeResult" class="retranscribe-result"></div>
+        </div>
     </div>
 
     <!-- History Panel (slide-over drawer) -->

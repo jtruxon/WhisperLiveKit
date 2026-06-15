@@ -7,6 +7,38 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
+# <CERTIFICATES>
+# install custom root cert support & import certificates from working folder
+COPY ./*.pem ./
+RUN command -v apt-get >/dev/null && \
+        { apt-get update -y; apt-get install --fix-missing -y apt-transport-https ca-certificates; } || \
+        { apk add --no-cache ca-certificates; }
+RUN for file in *.pem; do mv -- "$file" "${file%.pem}.crt"; done \
+        && cp -p *.crt /usr/local/share/ca-certificates \
+        && update-ca-certificates \
+        && if command -v keytool >/dev/null; then \
+               for file in *.crt; do \
+                   alias=$(basename -s .crt $file); \
+                   keytool -import -trustcacerts -file $file -alias $alias -keystore $JAVA_HOME/lib/security/cacerts -storepass changeit -noprompt; \
+               done; \
+           fi
+
+# Python `requests`, `aiohttp`
+ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+# Python `requests`
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+# NodeJS
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+
+#  HTTPX client, foundational to LangChain > 1.0
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt  
+
+# Java
+ENV JAVA_OPTS="$JAVA_OPTS -Djavax.net.ssl.trustStore=$JAVA_HOME/lib/security/cacerts"
+# </CERTIFICATES>
+
 RUN apt-get update && \
   apt-get install -y --no-install-recommends \
   build-essential \
@@ -48,6 +80,38 @@ FROM debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /app
+
+# <CERTIFICATES>
+# install custom root cert support & import certificates from working folder
+COPY ./*.pem ./
+RUN command -v apt-get >/dev/null && \
+        { apt-get update -y; apt-get install --fix-missing -y apt-transport-https ca-certificates; } || \
+        { apk add --no-cache ca-certificates; }
+RUN for file in *.pem; do mv -- "$file" "${file%.pem}.crt"; done \
+        && cp -p *.crt /usr/local/share/ca-certificates \
+        && update-ca-certificates \
+        && if command -v keytool >/dev/null; then \
+               for file in *.crt; do \
+                   alias=$(basename -s .crt $file); \
+                   keytool -import -trustcacerts -file $file -alias $alias -keystore $JAVA_HOME/lib/security/cacerts -storepass changeit -noprompt; \
+               done; \
+           fi
+
+# Python `requests`, `aiohttp`
+ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+# Python `requests`
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+# NodeJS
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+
+#  HTTPX client, foundational to LangChain > 1.0
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt  
+
+# Java
+ENV JAVA_OPTS="$JAVA_OPTS -Djavax.net.ssl.trustStore=$JAVA_HOME/lib/security/cacerts"
+# </CERTIFICATES>
 
 RUN apt-get update && \
   apt-get install -y --no-install-recommends \

@@ -41,6 +41,13 @@ let historyAudio = null;
 let historyAnimFrame = null;
 let currentHistoryDetailId = null;
 
+// --- Phase 1B: download / re-transcribe state ---
+// Most recently completed session audio (Blob), retained for download.
+// Populated when stopRecording() flushes the encoder worker and resolves
+// pendingAudioSave. Cleared when a new recording begins.
+let lastSessionAudioBlob = null;
+let lastSessionAudioStartedAt = null; // Date object for filename timestamp
+
 // --- History Store (IndexedDB + localStorage) ---
 const historyStore = {
   DB_NAME: 'WhisperLiveKitHistory',
@@ -342,6 +349,32 @@ function fmt1(x) {
   return Number.isFinite(n) ? n.toFixed(1) : x;
 }
 
+// Return the separator (usually " " or "") that should be inserted between two
+// text fragments coming from the server, to prevent run-on concatenation when
+// neither side carries the boundary whitespace.
+//
+// Server-side, line.text is built with sep="" or sep=" " depending on the
+// backend (Whisper-family tokens carry leading spaces; voxtral/qwen3/faster-
+// whisper tokens may not). The buffer fields are likewise backend-dependent.
+// On the JS side we control the seams between (committed line) ↔ buffer_*,
+// and between consecutive buffer_* spans. If the left fragment ends with
+// whitespace OR the right fragment starts with whitespace, no separator is
+// needed. CJK characters and most punctuation don't need a leading space
+// either.
+const _CJK_RE = /[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]/;
+const _NO_LEAD_SPACE_RE = /^[\s.,!?;:)\]\}\u3001\u3002\uff0c\uff0e\uff1f\uff01]/;
+function joinSeparator(left, right) {
+  if (!left || !right) return "";
+  const lastChar = left[left.length - 1];
+  const firstChar = right[0];
+  if (/\s/.test(lastChar) || /\s/.test(firstChar)) return "";
+  // Don't insert a space before punctuation that should hug the previous word.
+  if (_NO_LEAD_SPACE_RE.test(right)) return "";
+  // CJK on either side of the seam: no space.
+  if (_CJK_RE.test(lastChar) && _CJK_RE.test(firstChar)) return "";
+  return " ";
+}
+
 let host, port, protocol;
 port = 8000;
 if (isExtension) {
@@ -577,6 +610,12 @@ function renderLinesWithBuffer(
       }
 
       let currentLineText = item.text || "";
+      // Track the plain visible text in parallel with the HTML so we can decide
+      // whether each upcoming buffer fragment needs a leading separator. This
+      // prevents run-on concatenation at the (committed line)↔buffer_* and
+      // buffer_*↔buffer_* seams when neither side carries boundary whitespace
+      // (e.g. backends with sep="" like faster-whisper / qwen3 / voxtral).
+      let plainSoFar = currentLineText;
 
       if (idx === effectiveLines.length - 1) {
         if (!isFinalizing && item.speaker !== -2) {
@@ -592,20 +631,29 @@ function renderLinesWithBuffer(
         }
 
         if (buffer_diarization) {
+          const sep = joinSeparator(plainSoFar, buffer_diarization);
           if (isFinalizing) {
-            currentLineText +=
-              (currentLineText.length > 0 && buffer_diarization.trim().length > 0 ? " " : "") + buffer_diarization.trim();
+            const trimmed = buffer_diarization.trim();
+            const finalSep = joinSeparator(plainSoFar, trimmed);
+            currentLineText += finalSep + trimmed;
+            plainSoFar += finalSep + trimmed;
           } else {
-            currentLineText += `<span class="buffer_diarization">${buffer_diarization}</span>`;
+            // Insert the separator OUTSIDE the buffer span so it visibly
+            // separates the committed line from the still-pending buffer.
+            currentLineText += `${sep}<span class="buffer_diarization">${buffer_diarization}</span>`;
+            plainSoFar += sep + buffer_diarization;
           }
         }
         if (buffer_transcription) {
+          const sep = joinSeparator(plainSoFar, buffer_transcription);
           if (isFinalizing) {
-            currentLineText +=
-              (currentLineText.length > 0 && buffer_transcription.trim().length > 0 ? " " : "") +
-              buffer_transcription.trim();
+            const trimmed = buffer_transcription.trim();
+            const finalSep = joinSeparator(plainSoFar, trimmed);
+            currentLineText += finalSep + trimmed;
+            plainSoFar += finalSep + trimmed;
           } else {
-            currentLineText += `<span class="buffer_transcription">${buffer_transcription}</span>`;
+            currentLineText += `${sep}<span class="buffer_transcription">${buffer_transcription}</span>`;
+            plainSoFar += sep + buffer_transcription;
           }
         }
       }
@@ -823,6 +871,11 @@ async function startRecording() {
     timerInterval = setInterval(updateTimer, 1000);
     drawWaveform();
 
+    // Phase 1B: a new session begins — invalidate previous downloadable audio.
+    lastSessionAudioBlob = null;
+    lastSessionAudioStartedAt = new Date(recordingStartTime);
+    updateDownloadAudioButton();
+
     isRecording = true;
     updateUI();
   } catch (err) {
@@ -974,6 +1027,12 @@ async function saveRecordingToHistory() {
       lines: lastReceivedData ? (lastReceivedData.lines || []) : [],
       audioRef: id
     };
+
+    // Phase 1B: cache the blob so the toolbar Download button can serve it.
+    if (blob) {
+      lastSessionAudioBlob = blob;
+      updateDownloadAudioButton();
+    }
 
     await historyStore.save(entry, blob);
     console.log('Recording saved to history:', id);
@@ -1474,4 +1533,176 @@ function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
   return div.innerHTML;
+}
+
+// ===== Phase 1B: Download Audio + Re-transcribe handlers =====
+
+const downloadAudioBtn = document.getElementById("downloadAudioBtn");
+const retranscribeBtn = document.getElementById("retranscribeBtn");
+const retranscribeFileInput = document.getElementById("retranscribeFileInput");
+const retranscribeSection = document.getElementById("retranscribeSection");
+const retranscribeFileName = document.getElementById("retranscribeFileName");
+const retranscribeStatus = document.getElementById("retranscribeStatus");
+const retranscribeResult = document.getElementById("retranscribeResult");
+const retranscribeCloseBtn = document.getElementById("retranscribeCloseBtn");
+
+function updateDownloadAudioButton() {
+  if (!downloadAudioBtn) return;
+  const ok = !!lastSessionAudioBlob && lastSessionAudioBlob.size > 0;
+  downloadAudioBtn.disabled = !ok;
+  downloadAudioBtn.title = ok
+    ? "Download session audio"
+    : "No recorded audio yet — record a session first";
+}
+
+function _audioFileExtensionForBlob(blob) {
+  // mp3_encoder_worker.js currently emits audio/wav; MediaRecorder path emits audio/webm.
+  // Pick the extension that matches the actual MIME so the file is playable.
+  if (!blob) return "wav";
+  const t = (blob.type || "").toLowerCase();
+  if (t.includes("webm")) return "webm";
+  if (t.includes("ogg")) return "ogg";
+  if (t.includes("mpeg") || t.includes("mp3")) return "mp3";
+  return "wav";
+}
+
+function _formatTimestampForFilename(d) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    d.getFullYear().toString() +
+    pad(d.getMonth() + 1) +
+    pad(d.getDate()) +
+    "-" +
+    pad(d.getHours()) +
+    pad(d.getMinutes()) +
+    pad(d.getSeconds())
+  );
+}
+
+function downloadSessionAudio() {
+  if (!lastSessionAudioBlob || lastSessionAudioBlob.size === 0) {
+    return;
+  }
+  const ts = _formatTimestampForFilename(lastSessionAudioStartedAt || new Date());
+  const ext = _audioFileExtensionForBlob(lastSessionAudioBlob);
+  const filename = `whisperlivekit-session-${ts}.${ext}`;
+  const url = URL.createObjectURL(lastSessionAudioBlob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+if (downloadAudioBtn) {
+  downloadAudioBtn.addEventListener("click", downloadSessionAudio);
+  updateDownloadAudioButton();
+}
+
+// --- Re-transcribe ---
+
+const RETRANSCRIBE_MAX_BYTES = 100 * 1024 * 1024; // 100 MB; server enforces too
+
+function _retranscribeShow() {
+  if (retranscribeSection) retranscribeSection.style.display = "";
+}
+
+function _retranscribeHide() {
+  if (retranscribeSection) retranscribeSection.style.display = "none";
+  if (retranscribeResult) retranscribeResult.innerHTML = "";
+  if (retranscribeStatus) retranscribeStatus.textContent = "";
+  if (retranscribeFileName) retranscribeFileName.textContent = "";
+}
+
+function _retranscribeRender(payload, filename) {
+  if (!retranscribeResult) return;
+  // Prefer line-by-line rendering (FrontData shape). Fall back to flat text.
+  const lines = Array.isArray(payload && payload.lines) ? payload.lines : [];
+  const visible = lines.filter(
+    (l) => l && l.text && l.speaker !== -2 && l.speaker !== 0
+  );
+  if (visible.length > 0) {
+    retranscribeResult.innerHTML = visible
+      .map((l) => {
+        const tinfo =
+          l.start !== undefined && l.end !== undefined
+            ? ` <span style="color: var(--muted); font-size: 11px;">[${l.start} – ${l.end}]</span>`
+            : "";
+        const sp =
+          typeof l.speaker === "number" && l.speaker > 0
+            ? `<strong>Speaker ${l.speaker}:</strong> `
+            : "";
+        return `<p>${sp}${escapeHtml(l.text)}${tinfo}</p>`;
+      })
+      .join("");
+  } else {
+    const flat =
+      (payload && (payload.text || payload.transcript)) ||
+      lines.map((l) => l && l.text).filter(Boolean).join(" ");
+    retranscribeResult.innerHTML = `<p>${escapeHtml(flat || "(empty transcript)")}</p>`;
+  }
+  if (retranscribeFileName) retranscribeFileName.textContent = filename;
+  if (retranscribeStatus) {
+    const lang = payload && (payload.language || payload.detected_language);
+    retranscribeStatus.textContent = lang
+      ? `Done. Detected language: ${lang}`
+      : "Done.";
+  }
+}
+
+async function uploadAndRetranscribe(file) {
+  if (!file) return;
+  if (file.size > RETRANSCRIBE_MAX_BYTES) {
+    alert(`File too large (${(file.size / 1024 / 1024).toFixed(1)} MB). Limit is 100 MB.`);
+    return;
+  }
+  _retranscribeShow();
+  if (retranscribeFileName) retranscribeFileName.textContent = file.name;
+  if (retranscribeStatus) retranscribeStatus.textContent = "Uploading & transcribing… (this can take a while for long files)";
+  if (retranscribeResult) retranscribeResult.innerHTML = "";
+  if (retranscribeBtn) retranscribeBtn.disabled = true;
+
+  // Endpoint is same-origin: /api/retranscribe (sibling of /asr WebSocket).
+  const url = (window.location.origin || "") + "/api/retranscribe";
+  const fd = new FormData();
+  fd.append("audio", file, file.name);
+
+  try {
+    const resp = await fetch(url, { method: "POST", body: fd });
+    if (!resp.ok) {
+      let detail = `HTTP ${resp.status}`;
+      try {
+        const j = await resp.json();
+        if (j && j.detail) detail += ` — ${j.detail}`;
+      } catch (_) {
+        try { detail += ` — ${await resp.text()}`; } catch (_) {}
+      }
+      if (retranscribeStatus) retranscribeStatus.textContent = `Failed: ${detail}`;
+      return;
+    }
+    const payload = await resp.json();
+    _retranscribeRender(payload, file.name);
+  } catch (err) {
+    console.error("Re-transcription failed:", err);
+    if (retranscribeStatus) retranscribeStatus.textContent = `Failed: ${err.message || err}`;
+  } finally {
+    if (retranscribeBtn) retranscribeBtn.disabled = false;
+    if (retranscribeFileInput) retranscribeFileInput.value = ""; // allow re-picking same file
+  }
+}
+
+if (retranscribeBtn && retranscribeFileInput) {
+  retranscribeBtn.addEventListener("click", () => {
+    retranscribeFileInput.click();
+  });
+  retranscribeFileInput.addEventListener("change", (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) uploadAndRetranscribe(f);
+  });
+}
+
+if (retranscribeCloseBtn) {
+  retranscribeCloseBtn.addEventListener("click", _retranscribeHide);
 }

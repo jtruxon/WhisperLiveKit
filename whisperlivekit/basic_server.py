@@ -1,9 +1,11 @@
 import asyncio
 import logging
+import os
+import tempfile
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
@@ -156,7 +158,6 @@ async def _convert_to_pcm(audio_bytes: bytes) -> bytes:
     )
     stdout, stderr = await proc.communicate(input=audio_bytes)
     if proc.returncode != 0:
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=f"Audio conversion failed: {stderr.decode().strip()}")
     return stdout
 
@@ -264,7 +265,6 @@ async def create_transcription(
 
     audio_bytes = await file.read()
     if not audio_bytes:
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="Empty audio file")
 
     # Convert to PCM for pipeline processing
@@ -331,6 +331,189 @@ async def list_models():
             "owned_by": "whisperlivekit",
         }],
     })
+
+
+# ---------------------------------------------------------------------------
+# Re-transcription API  (Phase 1B)
+# ---------------------------------------------------------------------------
+#
+# POST /api/retranscribe
+#   multipart/form-data, field name "audio" — uploaded audio file (mp3, wav,
+#   m4a, flac, ogg, webm, …; whatever ffmpeg can decode).
+#   Optional form field "language" — ISO language code passed through to the
+#   per-session ASR proxy via online_factory's language= argument (NOT mutated
+#   on the shared singleton ASR — see SessionASRProxy / AGENTS.md).
+#
+# The endpoint streams the upload to a temp file (capped at RETRANSCRIBE_MAX_BYTES),
+# decodes to PCM via ffmpeg, then runs the audio through a *fresh*
+# AudioProcessor that shares the existing TranscriptionEngine singleton.
+# Heavy backend calls (model.transcribe / generate) are already wrapped in
+# asyncio.to_thread inside AudioProcessor (see audio_processor.py:308,408),
+# so this handler does not block the event loop on inference.
+#
+# Response is the canonical FrontData.to_dict() JSON (same wire format as the
+# WebSocket) plus a convenience flat "text" field. No FrontData fields are
+# added or renamed (per AGENTS.md, doing so would also require updates to
+# diff_protocol.py and _format_openai_response).
+
+RETRANSCRIBE_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
+RETRANSCRIBE_TIMEOUT_SEC = 600.0  # 10 min upper bound for very long files
+
+
+@app.post("/api/retranscribe")
+async def retranscribe(
+    audio: UploadFile = File(...),
+    language: Optional[str] = Form(default=None),
+):
+    """Re-transcribe an uploaded audio file via the existing TranscriptionEngine.
+
+    Returns the canonical FrontData wire format (lines, buffers, etc.) plus a
+    flat ``text`` field combining all non-silence segments.
+    """
+    global transcription_engine
+
+    if transcription_engine is None:
+        raise HTTPException(status_code=503, detail="Transcription engine not ready")
+
+    # Stream to a temp file so we don't hold a multi-MB upload entirely in RAM.
+    # Cap at RETRANSCRIBE_MAX_BYTES — return 413 if exceeded.
+    suffix = os.path.splitext(audio.filename or "")[1] or ".bin"
+    tmp = tempfile.NamedTemporaryFile(prefix="wlk-retranscribe-", suffix=suffix, delete=False)
+    tmp_path = tmp.name
+    try:
+        try:
+            total = 0
+            chunk_size = 1 << 20  # 1 MiB
+            while True:
+                chunk = await audio.read(chunk_size)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > RETRANSCRIBE_MAX_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Upload exceeds {RETRANSCRIBE_MAX_BYTES // (1024 * 1024)} MB limit",
+                    )
+                tmp.write(chunk)
+            tmp.close()
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read upload: {e}") from e
+
+        if total == 0:
+            raise HTTPException(status_code=400, detail="Empty audio file")
+
+        # Decode to 16 kHz mono PCM s16le via ffmpeg (same parameters used elsewhere).
+        # We read the file in chunks rather than loading it into memory.
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-i", tmp_path,
+                "-f", "s16le",
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                "pipe:1",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"ffmpeg decode failed: {stderr.decode(errors='replace').strip()}",
+                )
+            pcm_data = stdout
+        except FileNotFoundError as e:
+            raise HTTPException(
+                status_code=500,
+                detail="ffmpeg not found on server PATH",
+            ) from e
+
+        if not pcm_data:
+            raise HTTPException(status_code=400, detail="No audio decoded from file")
+
+        duration_sec = len(pcm_data) / (16000 * 2)
+        logger.info(
+            "retranscribe: file=%s size=%d bytes, decoded %.2fs of audio",
+            audio.filename, total, duration_sec,
+        )
+
+        # Run through the existing pipeline. Re-use the singleton engine —
+        # NEVER call TranscriptionEngine.reset() here (that's test-only and
+        # would tear down every live WebSocket session). A fresh AudioProcessor
+        # gives us a per-request session that shares the singleton's models.
+        processor = AudioProcessor(
+            transcription_engine=transcription_engine,
+            language=language,  # routed through SessionASRProxy via online_factory
+        )
+        # Force PCM input regardless of server config (we already decoded).
+        processor.is_pcm_input = True
+
+        results_gen = await processor.create_tasks()
+        final_result = None
+
+        async def _collect():
+            nonlocal final_result
+            async for result in results_gen:
+                final_result = result
+
+        collect_task = asyncio.create_task(_collect())
+
+        try:
+            # Feed PCM in 1-second chunks (matches /v1/audio/transcriptions).
+            chunk_bytes = 16000 * 2
+            for i in range(0, len(pcm_data), chunk_bytes):
+                await processor.process_audio(pcm_data[i:i + chunk_bytes])
+            # Signal end-of-stream
+            await processor.process_audio(b"")
+
+            try:
+                await asyncio.wait_for(collect_task, timeout=RETRANSCRIBE_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "retranscribe: timed out after %.0fs (file=%s)",
+                    RETRANSCRIBE_TIMEOUT_SEC, audio.filename,
+                )
+        finally:
+            await processor.cleanup()
+
+        if final_result is None:
+            return JSONResponse({
+                "text": "",
+                "lines": [],
+                "buffer_transcription": "",
+                "buffer_diarization": "",
+                "buffer_translation": "",
+                "duration": round(duration_sec, 2),
+                "filename": audio.filename,
+            })
+
+        # Canonical FrontData payload — same shape the WebSocket emits.
+        payload = final_result.to_dict()
+        # Add convenience flat text (mirrors _format_openai_response join logic).
+        text_parts = [
+            line.get("text", "")
+            for line in payload.get("lines", [])
+            if line.get("text") and line.get("speaker", 0) != -2
+        ]
+        payload["text"] = " ".join(p.strip() for p in text_parts if p).strip()
+        payload["duration"] = round(duration_sec, 2)
+        payload["filename"] = audio.filename
+        if language:
+            payload["language"] = language
+
+        return JSONResponse(payload)
+    finally:
+        # Always clean up the temp file.
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception as cleanup_err:
+            logger.warning("retranscribe: failed to remove temp file %s: %s", tmp_path, cleanup_err)
 
 
 def main():
