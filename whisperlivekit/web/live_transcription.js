@@ -1038,14 +1038,24 @@ async function saveRecordingToHistory() {
     await historyStore.save(entry, blob);
     console.log('Recording saved to history:', id);
 
+    // Phase 2B: surface a toast instead of just logging.
+    try {
+      showToast({
+        message: 'Recording saved to history',
+        kind: 'success',
+      });
+    } catch (e) { /* toast unavailable — non-fatal */ }
+
     // Clean up encoder worker
     if (audioEncoderWorker) {
       audioEncoderWorker.terminate();
       audioEncoderWorker = null;
     }
 
-    // Update history panel if open
-    if (document.getElementById('historyPanel').classList.contains('visible')) {
+    // Update history panel if open (`.open` is the new Phase 2B class;
+    // `.visible` is kept for any legacy code path).
+    const panelEl = document.getElementById('historyPanel');
+    if (panelEl && (panelEl.classList.contains('open') || panelEl.classList.contains('visible'))) {
       renderHistoryList();
     }
   } catch (err) {
@@ -1189,6 +1199,481 @@ if (isExtension) {
   void checkAndRequestPermissions();
 }
 
+// ===== Phase 2B: Toast deck (showToast / hideToast) =====
+//
+// Shape:
+//   showToast({ message, kind='info', actionLabel, onAction, dismissAfterMs })
+//     → returns string toast id
+//   hideToast(id)
+//
+// kind: 'info'|'success'  → role="status" (polite)
+//       'warn'|'error'    → role="alert"  (assertive)
+// 'info' and 'success' auto-dismiss after dismissAfterMs (default 5000).
+// 'warn' and 'error' do NOT auto-dismiss; the user must click the close ×.
+const Toast = (() => {
+  let counter = 0;
+  const timers = new Map();
+
+  function deck() {
+    return document.getElementById('toastDeck');
+  }
+
+  function _kindRole(kind) {
+    return (kind === 'warn' || kind === 'error') ? 'alert' : 'status';
+  }
+
+  function show(opts) {
+    const o = opts || {};
+    const message = o.message == null ? '' : String(o.message);
+    const kind = o.kind || 'info';
+    const id = 'toast_' + (++counter) + '_' + Date.now().toString(36);
+    const d = deck();
+    if (!d) {
+      // Last-ditch fallback so the caller still gets feedback if the deck
+      // markup is missing for any reason.
+      console.log('[toast]', kind, message);
+      return id;
+    }
+
+    const el = document.createElement('div');
+    el.className = 'toast toast--' + kind;
+    el.setAttribute('role', _kindRole(kind));
+    el.dataset.toastId = id;
+
+    const msgEl = document.createElement('div');
+    msgEl.className = 'toast-message';
+    msgEl.textContent = message;
+    el.appendChild(msgEl);
+
+    if (o.actionLabel && typeof o.onAction === 'function') {
+      const actionBtn = document.createElement('button');
+      actionBtn.type = 'button';
+      actionBtn.className = 'toast-action';
+      actionBtn.textContent = o.actionLabel;
+      actionBtn.addEventListener('click', () => {
+        try { o.onAction(); } catch (e) { console.error(e); }
+        hide(id);
+      });
+      el.appendChild(actionBtn);
+    }
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'toast-close';
+    closeBtn.setAttribute('aria-label', 'Dismiss notification');
+    closeBtn.textContent = '×';
+    closeBtn.addEventListener('click', () => hide(id));
+    el.appendChild(closeBtn);
+
+    d.appendChild(el);
+
+    const autoMs = (typeof o.dismissAfterMs === 'number') ? o.dismissAfterMs :
+      ((kind === 'info' || kind === 'success') ? 5000 : 0);
+    if (autoMs > 0) {
+      const t = setTimeout(() => hide(id), autoMs);
+      timers.set(id, t);
+    }
+
+    return id;
+  }
+
+  function hide(id) {
+    const t = timers.get(id);
+    if (t) {
+      clearTimeout(t);
+      timers.delete(id);
+    }
+    const d = deck();
+    if (!d) return;
+    const el = d.querySelector('[data-toast-id="' + id + '"]');
+    if (el && el.parentNode) {
+      el.parentNode.removeChild(el);
+    }
+  }
+
+  return { show, hide };
+})();
+
+// Convenience exports — used throughout the rest of the file.
+function showToast(opts) { return Toast.show(opts); }
+// eslint-disable-next-line no-unused-vars
+function hideToast(id) { return Toast.hide(id); }
+
+// ===== Phase 2B: Overlay stack (Esc + backdrop close the topmost) =====
+//
+// Phase 2B intentionally does NOT install focus traps — that's 2G's job.
+// This stack is purely about: which overlay does Esc/backdrop close right
+// now? When the stack is empty, the backdrop hides itself.
+const OverlayManager = (() => {
+  const stack = [];
+
+  function _backdrop() {
+    return document.getElementById('panelBackdrop');
+  }
+
+  function _refreshBackdrop() {
+    const bd = _backdrop();
+    if (!bd) return;
+    if (stack.length > 0) {
+      bd.hidden = false;
+      // Force a layout flush so the transition runs from rgba(0,0,0,0).
+      // (Reading offsetWidth is the canonical trick.)
+      // eslint-disable-next-line no-unused-expressions
+      bd.offsetWidth;
+      bd.classList.add('open');
+    } else {
+      bd.classList.remove('open');
+      bd.hidden = true;
+    }
+  }
+
+  function push(name) {
+    // Don't double-push the same overlay.
+    if (stack[stack.length - 1] === name) return;
+    // If already present below the top, leave the existing entry in place
+    // and append a new top-of-stack entry — closing it pops just this one.
+    stack.push(name);
+    _refreshBackdrop();
+  }
+
+  function remove(name) {
+    for (let i = stack.length - 1; i >= 0; i--) {
+      if (stack[i] === name) {
+        stack.splice(i, 1);
+        break;
+      }
+    }
+    _refreshBackdrop();
+  }
+
+  function closeTop() {
+    const top = stack[stack.length - 1];
+    if (!top) return false;
+    if (top === 'historyDetail') {
+      closeHistoryDetail();
+    } else if (top === 'historyPanel') {
+      closeHistoryPanel();
+    } else if (top === 'toolbarOverflow') {
+      ToolbarOverflow.close();
+    } else {
+      // Unknown overlay — pop defensively.
+      stack.pop();
+      _refreshBackdrop();
+    }
+    return true;
+  }
+
+  function size() { return stack.length; }
+
+  return { push, remove, closeTop, size };
+})();
+
+// Backdrop click closes the topmost overlay.
+document.addEventListener('DOMContentLoaded', () => {
+  const bd = document.getElementById('panelBackdrop');
+  if (bd) {
+    bd.addEventListener('click', () => {
+      OverlayManager.closeTop();
+    });
+  }
+});
+
+// Esc closes topmost overlay (toolbar overflow popover counts too).
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' && e.key !== 'Esc') return;
+  // If the toolbar overflow popover is open and not yet on the OverlayManager
+  // stack (it isn't — the popover is light-weight), close it first.
+  if (ToolbarOverflow.isOpen()) {
+    e.preventDefault();
+    ToolbarOverflow.close();
+    return;
+  }
+  if (OverlayManager.size() > 0) {
+    e.preventDefault();
+    OverlayManager.closeTop();
+  }
+});
+
+// ===== Phase 2B: Toolbar overflow (⋯) popover =====
+//
+// The toolbar holds each button exactly once. At narrow viewports the
+// `.toolbar-group--tools` (≤ 767 px) and additionally `.toolbar-group--session`
+// (≤ 480 px or `html.is-extension`) groups are reparented in their entirety
+// into `#toolbarOverflowMenu`. On resize back, the buttons go home. This
+// keeps a single DOM instance per button (so all existing event listeners
+// keep working) instead of duplicating them.
+const ToolbarOverflow = (() => {
+  let openState = false;
+  let lastBreakpoint = null;
+
+  function _btn() { return document.getElementById('toolbarOverflowBtn'); }
+  function _menu() { return document.getElementById('toolbarOverflowMenu'); }
+  function _toolbar() { return document.querySelector('.toolbar'); }
+
+  // Decide which groups should live in the overflow at the current viewport.
+  // Returns one of: 'desktop' | 'tablet' | 'mobile'.
+  function _currentBreakpoint() {
+    const isExt = document.documentElement.classList.contains('is-extension');
+    const w = window.innerWidth;
+    if (isExt || w <= 480) return 'mobile';
+    if (w <= 767) return 'tablet';
+    return 'desktop';
+  }
+
+  function _groupsForBreakpoint(bp) {
+    if (bp === 'mobile') return ['session', 'tools'];
+    if (bp === 'tablet') return ['tools'];
+    return [];
+  }
+
+  // Move buttons in-place between the toolbar group containers and the
+  // overflow menu, preserving order and event listeners.
+  function _layout() {
+    const toolbar = _toolbar();
+    const menu = _menu();
+    if (!toolbar || !menu) return;
+    const bp = _currentBreakpoint();
+    if (bp === lastBreakpoint) return; // Nothing to do.
+    lastBreakpoint = bp;
+
+    // Close popover whenever breakpoint changes (per brief 2B.2.d).
+    close();
+
+    const overflowed = new Set(_groupsForBreakpoint(bp));
+
+    // For each known group, ensure its members are either in the inline
+    // group container or in the overflow menu (never both).
+    ['session', 'tools'].forEach((groupName) => {
+      const inline = toolbar.querySelector('[data-toolbar-group="' + groupName + '"]');
+      if (!inline) return;
+
+      if (overflowed.has(groupName)) {
+        // Move every direct child button from inline → menu (if not already).
+        Array.from(inline.children).forEach((child) => {
+          if (child.tagName === 'BUTTON') {
+            child.dataset.overflowOrigin = groupName;
+            menu.appendChild(child);
+          }
+        });
+      } else {
+        // Move members back home from the menu.
+        Array.from(menu.children).forEach((child) => {
+          if (child.dataset && child.dataset.overflowOrigin === groupName) {
+            inline.appendChild(child);
+            delete child.dataset.overflowOrigin;
+          }
+        });
+      }
+    });
+  }
+
+  function open() {
+    const btn = _btn();
+    const menu = _menu();
+    if (!btn || !menu) return;
+    menu.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+    openState = true;
+    // Close on outside click.
+    setTimeout(() => {
+      document.addEventListener('click', _outsideClick, { once: true });
+    }, 0);
+  }
+
+  function close() {
+    const btn = _btn();
+    const menu = _menu();
+    if (!btn || !menu) return;
+    menu.hidden = true;
+    btn.setAttribute('aria-expanded', 'false');
+    openState = false;
+  }
+
+  function toggle() {
+    if (openState) close(); else open();
+  }
+
+  function isOpen() { return openState; }
+
+  function _outsideClick(e) {
+    const menu = _menu();
+    const btn = _btn();
+    if (!menu || !btn) return;
+    if (menu.contains(e.target) || btn.contains(e.target)) {
+      // Clicked inside menu/button — re-arm for next outside click.
+      if (openState) {
+        document.addEventListener('click', _outsideClick, { once: true });
+      }
+      return;
+    }
+    close();
+  }
+
+  function init() {
+    const btn = _btn();
+    const menu = _menu();
+    if (btn) {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggle();
+      });
+    }
+    if (menu) {
+      // Selecting any item in the menu closes the popover (brief 2B.2.c).
+      menu.addEventListener('click', (e) => {
+        const target = e.target.closest('button');
+        if (target) close();
+      });
+    }
+    _layout();
+    let resizeRaf = 0;
+    window.addEventListener('resize', () => {
+      if (resizeRaf) return;
+      resizeRaf = requestAnimationFrame(() => {
+        resizeRaf = 0;
+        _layout();
+      });
+    });
+  }
+
+  return { init, open, close, toggle, isOpen };
+})();
+
+// ===== Phase 2B: Compact header (Q1 default ON, pin to disable) =====
+//
+// Compact-header engages 30s after recording starts. The user can pin the
+// header full-size via #compactPinBtn; the pinned-off state is persisted
+// in localStorage under `wlk_compact_header_pinned_off` (boolean).
+const CompactHeader = (() => {
+  const STORAGE_KEY = 'wlk_compact_header_pinned_off';
+  const ENGAGE_AFTER_MS = 30000;
+  let engageTimer = null;
+  let ariaTimer = null;
+
+  function isPinnedOff() {
+    try {
+      return localStorage.getItem(STORAGE_KEY) === '1';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setPinnedOff(value) {
+    try {
+      if (value) {
+        localStorage.setItem(STORAGE_KEY, '1');
+      } else {
+        localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch (e) { /* private mode — ignore */ }
+  }
+
+  function _engage() {
+    document.documentElement.classList.add('compact-header');
+    _startAriaTimer();
+  }
+
+  function _disengage() {
+    document.documentElement.classList.remove('compact-header');
+    _stopAriaTimer();
+    // Restore the record button's aria-label to its default.
+    const rb = document.getElementById('recordButton');
+    if (rb) rb.setAttribute('aria-label', 'Start or stop recording');
+  }
+
+  function _formatTimer(ms) {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return m + ':' + s.toString().padStart(2, '0');
+  }
+
+  function _startAriaTimer() {
+    _stopAriaTimer();
+    ariaTimer = setInterval(() => {
+      const rb = document.getElementById('recordButton');
+      // Use the global startTime (shared with the existing recording timer).
+      const t = (typeof startTime === 'number' && startTime)
+        ? (Date.now() - startTime) : 0;
+      if (rb) {
+        rb.setAttribute(
+          'aria-label',
+          'Recording — ' + _formatTimer(t) + '. Click to stop.'
+        );
+      }
+    }, 1000);
+  }
+
+  function _stopAriaTimer() {
+    if (ariaTimer) {
+      clearInterval(ariaTimer);
+      ariaTimer = null;
+    }
+  }
+
+  function onRecordingStart() {
+    if (engageTimer) clearTimeout(engageTimer);
+    engageTimer = setTimeout(_engage, ENGAGE_AFTER_MS);
+  }
+
+  function onRecordingStop() {
+    if (engageTimer) {
+      clearTimeout(engageTimer);
+      engageTimer = null;
+    }
+    _disengage();
+  }
+
+  function _refreshPinUI() {
+    const btn = document.getElementById('compactPinBtn');
+    if (!btn) return;
+    const off = isPinnedOff();
+    btn.setAttribute('aria-pressed', off ? 'true' : 'false');
+    btn.title = off
+      ? 'Compact mode disabled — click to allow it'
+      : 'Pin header full-size (disable compact mode)';
+    document.documentElement.classList.toggle('compact-header-pinned-off', off);
+  }
+
+  function init() {
+    _refreshPinUI();
+    const btn = document.getElementById('compactPinBtn');
+    if (btn) {
+      btn.addEventListener('click', () => {
+        setPinnedOff(!isPinnedOff());
+        _refreshPinUI();
+      });
+    }
+  }
+
+  return { init, onRecordingStart, onRecordingStop };
+})();
+
+// Wire CompactHeader into the existing record state. We watch the
+// `recordButton.classList.contains('recording')` toggles via a MutationObserver
+// rather than threading a callback through stopRecording/startRecording —
+// that keeps this module non-invasive and 2D-1-friendly.
+document.addEventListener('DOMContentLoaded', () => {
+  CompactHeader.init();
+  ToolbarOverflow.init();
+
+  const rb = document.getElementById('recordButton');
+  if (rb && 'MutationObserver' in window) {
+    let wasRecording = rb.classList.contains('recording');
+    const mo = new MutationObserver(() => {
+      const nowRecording = rb.classList.contains('recording');
+      if (nowRecording === wasRecording) return;
+      wasRecording = nowRecording;
+      if (nowRecording) {
+        CompactHeader.onRecordingStart();
+      } else {
+        CompactHeader.onRecordingStop();
+      }
+    });
+    mo.observe(rb, { attributes: true, attributeFilter: ['class'] });
+  }
+});
+
 // ===== History Panel UI Logic =====
 
 function initHistoryPanel() {
@@ -1243,12 +1728,17 @@ function toggleHistoryPanel() {
   const toggle = document.getElementById('historyToggle');
   if (!panel) return;
 
-  const isVisible = panel.classList.contains('visible');
-  if (isVisible) {
+  const isOpen = panel.classList.contains('open');
+  if (isOpen) {
     closeHistoryPanel();
   } else {
-    panel.classList.add('visible');
-    if (toggle) toggle.classList.add('active');
+    panel.classList.add('open');
+    panel.setAttribute('aria-hidden', 'false');
+    if (toggle) {
+      toggle.classList.add('active');
+      toggle.setAttribute('aria-expanded', 'true');
+    }
+    OverlayManager.push('historyPanel');
     renderHistoryList();
   }
 }
@@ -1258,9 +1748,20 @@ function closeHistoryPanel() {
   const toggle = document.getElementById('historyToggle');
   const detail = document.getElementById('historyDetail');
 
-  if (detail) detail.classList.remove('visible');
-  if (panel) panel.classList.remove('visible');
-  if (toggle) toggle.classList.remove('active');
+  if (detail) {
+    detail.classList.remove('open', 'visible');
+    detail.setAttribute('aria-hidden', 'true');
+    OverlayManager.remove('historyDetail');
+  }
+  if (panel) {
+    panel.classList.remove('open', 'visible');
+    panel.setAttribute('aria-hidden', 'true');
+  }
+  if (toggle) {
+    toggle.classList.remove('active');
+    toggle.setAttribute('aria-expanded', 'false');
+  }
+  OverlayManager.remove('historyPanel');
 
   stopHistoryPlayback();
   currentHistoryDetailId = null;
@@ -1380,12 +1881,18 @@ async function openHistoryDetail(id) {
   }
 
   stopHistoryPlayback();
-  detail.classList.add('visible');
+  detail.classList.add('open');
+  detail.setAttribute('aria-hidden', 'false');
+  OverlayManager.push('historyDetail');
 }
 
 function closeHistoryDetail() {
   const detail = document.getElementById('historyDetail');
-  if (detail) detail.classList.remove('visible');
+  if (detail) {
+    detail.classList.remove('open', 'visible');
+    detail.setAttribute('aria-hidden', 'true');
+  }
+  OverlayManager.remove('historyDetail');
   stopHistoryPlayback();
   currentHistoryDetailId = null;
 }
@@ -1651,6 +2158,16 @@ function _retranscribeRender(payload, filename) {
       ? `Done. Detected language: ${lang}`
       : "Done.";
   }
+  // Phase 2B: surface re-transcribe completion as a toast.
+  try {
+    const lang = payload && (payload.language || payload.detected_language);
+    showToast({
+      message: lang
+        ? `Re-transcription of "${filename}" complete. Detected language: ${lang}.`
+        : `Re-transcription of "${filename}" complete.`,
+      kind: 'success',
+    });
+  } catch (e) { /* toast unavailable — non-fatal */ }
 }
 
 async function uploadAndRetranscribe(file) {

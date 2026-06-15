@@ -11,41 +11,73 @@
 <body>
     <div class="header-container">
         <div class="settings-container">
-            <div class="buttons-container">
-                <button id="recordButton" aria-label="Start or stop recording">
-                    <div class="shape-container">
-                        <div class="shape"></div>
-                    </div>
-                    <div class="recording-info">
-                        <div class="wave-container">
-                            <canvas id="waveCanvas"></canvas>
+            <!--
+              Phase 2B toolbar IA. Single source of truth for each button:
+              the buttons live exactly once in this markup. At narrow viewports,
+              JS reparents members of `.toolbar-group--session` and
+              `.toolbar-group--tools` into `#toolbarOverflowMenu`; on resize
+              back to a wider breakpoint, they are reparented home.
+              role="toolbar" exposes the grouping to assistive tech.
+            -->
+            <div class="buttons-container toolbar" role="toolbar" aria-label="Recording controls">
+                <div class="toolbar-group toolbar-group--primary">
+                    <button id="recordButton" aria-label="Start or stop recording">
+                        <div class="shape-container">
+                            <div class="shape"></div>
                         </div>
-                        <div class="timer">00:00</div>
-                    </div>
-                </button>
+                        <div class="recording-info">
+                            <div class="wave-container">
+                                <canvas id="waveCanvas"></canvas>
+                            </div>
+                            <div class="timer">00:00</div>
+                        </div>
+                    </button>
+                </div>
 
-                <button id="settingsToggle" class="settings-toggle" title="Show/hide settings" aria-label="Show or hide settings">
-                    <img src="web/src/settings.svg" alt="Settings" />
-                </button>
+                <div class="toolbar-group toolbar-group--session" data-toolbar-group="session">
+                    <button id="copyTranscript" class="copy-button" title="Copy transcript to clipboard" aria-label="Copy transcript to clipboard" style="display:none;">
+                        <img src="src/clipboard.svg" alt="Copy" width="20" height="20" />
+                    </button>
 
-                <button id="copyTranscript" class="copy-button" title="Copy transcript to clipboard" aria-label="Copy transcript to clipboard" style="display:none;">
-                    <img src="src/clipboard.svg" alt="Copy" width="20" height="20" />
-                </button>
+                    <button id="downloadAudioBtn" class="header-button download-audio-btn" title="Download session audio" aria-label="Download session audio" disabled>
+                        <span aria-hidden="true">⬇︎</span>
+                        <span class="btn-label">Audio</span>
+                    </button>
+                </div>
 
-                <button id="downloadAudioBtn" class="header-button download-audio-btn" title="Download session audio" disabled>
-                    <span aria-hidden="true">⬇︎</span>
-                    <span class="btn-label">Audio</span>
-                </button>
+                <div class="toolbar-group toolbar-group--tools" data-toolbar-group="tools">
+                    <button id="historyToggle" class="header-button history-toggle" title="Recording history" aria-label="Recording history" aria-expanded="false">
+                        <img src="src/history.svg" alt="History" width="20" height="20" />
+                    </button>
 
-                <button id="retranscribeBtn" class="header-button retranscribe-btn" title="Re-transcribe an audio file">
-                    <span aria-hidden="true">↻</span>
-                    <span class="btn-label">Re-transcribe…</span>
-                </button>
+                    <button id="retranscribeBtn" class="header-button retranscribe-btn" title="Re-transcribe an audio file" aria-label="Re-transcribe an audio file">
+                        <span aria-hidden="true">↻</span>
+                        <span class="btn-label">Re-transcribe…</span>
+                    </button>
+                </div>
+
                 <input id="retranscribeFileInput" type="file" accept="audio/*" style="display:none;" />
 
-                <button id="historyToggle" class="header-button history-toggle" title="Recording history" aria-label="Recording history">
-                    <img src="src/history.svg" alt="History" width="20" height="20" />
-                </button>
+                <div class="toolbar-overflow">
+                    <button id="toolbarOverflowBtn" class="header-button toolbar-overflow-btn" type="button"
+                            aria-haspopup="true" aria-expanded="false"
+                            aria-controls="toolbarOverflowMenu" aria-label="More actions">
+                        <span aria-hidden="true">⋯</span>
+                    </button>
+                    <div id="toolbarOverflowMenu" class="toolbar-overflow-menu" role="menu" hidden></div>
+                </div>
+
+                <div class="toolbar-group toolbar-group--trailing">
+                    <button id="compactPinBtn" class="header-button compact-pin-btn" type="button"
+                            title="Pin header full-size (disable compact mode)"
+                            aria-label="Pin header full-size" aria-pressed="false">
+                        <img src="src/pin.svg" alt="" width="18" height="18" />
+                    </button>
+
+                    <button id="settingsToggle" class="settings-toggle" title="Show/hide settings" aria-label="Show or hide settings">
+                        <img src="web/src/settings.svg" alt="Settings" />
+                    </button>
+                </div>
             </div>
 
             <div class="settings">
@@ -102,13 +134,16 @@
         </div>
     </div>
 
+    <!-- Phase 2B: backdrop dimming layer behind any open slide-over. -->
+    <div id="panelBackdrop" class="panel-backdrop" hidden></div>
+
     <!-- History Panel (slide-over drawer) -->
-    <div id="historyPanel" class="history-panel">
+    <div id="historyPanel" class="history-panel" role="dialog" aria-modal="false" aria-hidden="true" aria-labelledby="historyPanelTitle">
         <div class="history-panel-header">
             <button id="historyBack" class="history-header-btn" title="Close" aria-label="Close history panel">
                 <img src="src/arrow_back.svg" alt="Back" width="20" height="20" />
             </button>
-            <h3 class="history-panel-title">Recording History</h3>
+            <h3 id="historyPanelTitle" class="history-panel-title">Recording History</h3>
             <button id="historyClearAll" class="history-header-btn" title="Clear all recordings" aria-label="Clear all recordings">
                 <img src="src/trash.svg" alt="Clear All" width="18" height="18" />
             </button>
@@ -120,7 +155,7 @@
     </div>
 
     <!-- History Detail View (overlays history panel) -->
-    <div id="historyDetail" class="history-detail">
+    <div id="historyDetail" class="history-detail" role="dialog" aria-modal="false" aria-hidden="true" aria-labelledby="historyDetailTitle">
         <div class="history-detail-header">
             <button id="historyDetailBack" class="history-header-btn" title="Back to list" aria-label="Back to history list">
                 <img src="src/arrow_back.svg" alt="Back" width="20" height="20" />
@@ -148,6 +183,13 @@
         </div>
         <div id="historyDetailTranscript" class="history-detail-transcript"></div>
     </div>
+
+    <!--
+      Phase 2B: global toast deck. Direct child of <body> so it is not
+      clipped by .transcript-container scroll context. Position is set
+      via CSS (bottom-right desktop, bottom-center mobile/extension).
+    -->
+    <div id="toastDeck" class="toast-deck" role="region" aria-label="Notifications"></div>
 
     <script src="live_transcription.js"></script>
 </body>

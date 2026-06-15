@@ -207,6 +207,165 @@ body {
   gap: 15px;
 }
 
+/* ===== Phase 2B: Toolbar grouping (replaces flat 6-button row) ===== */
+.toolbar {
+  flex-wrap: wrap;
+  width: 100%;
+  justify-content: center;
+}
+
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Desktop: separators between groups (only the visible ones). */
+@media (min-width: 768px) {
+  .toolbar-group + .toolbar-group:not(.toolbar-group--hidden):not(:empty) {
+    padding-left: 12px;
+    margin-left: 2px;
+    border-left: 1px solid var(--border);
+  }
+  /* Suppress the separator on the trailing group when its preceding sibling
+     is the overflow container (which has its own padding). */
+  .toolbar-overflow + .toolbar-group--trailing {
+    border-left: none;
+    padding-left: 0;
+  }
+}
+
+.toolbar-group:empty {
+  display: none;
+}
+
+.toolbar-group--trailing {
+  margin-left: auto;
+}
+
+/* Pin button — same outline as the other icon round buttons. */
+.compact-pin-btn {
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--button-border);
+  border-radius: 50%;
+  background: var(--button-bg);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background-color 0.2s ease, opacity 0.15s ease;
+}
+
+.compact-pin-btn:hover {
+  background-color: var(--chip-bg);
+}
+
+.compact-pin-btn img {
+  width: 18px;
+  height: 18px;
+  opacity: 0.7;
+}
+
+.compact-pin-btn:hover img {
+  opacity: 1;
+}
+
+/* When the user has pinned compact-mode OFF, the pin button itself is shown
+   as "active/pressed" (the toggle is engaged). */
+.compact-pin-btn[aria-pressed="true"] {
+  background-color: var(--chip-bg);
+  border-color: var(--text);
+}
+
+/* ===== Toolbar overflow popover (⋯) ===== */
+.toolbar-overflow {
+  position: relative;
+  display: none; /* Becomes flex at narrow viewports — see breakpoints below. */
+  align-items: center;
+}
+
+.toolbar-overflow-btn {
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--button-border);
+  border-radius: 50%;
+  background: var(--button-bg);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--text);
+}
+
+.toolbar-overflow-btn:hover {
+  background-color: var(--chip-bg);
+}
+
+.toolbar-overflow-btn[aria-expanded="true"] {
+  background-color: var(--chip-bg);
+}
+
+.toolbar-overflow-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 200px;
+  padding: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  z-index: 250;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.toolbar-overflow-menu[hidden] {
+  display: none;
+}
+
+/* Buttons reparented into the popover get a uniform list-item appearance. */
+.toolbar-overflow-menu > button {
+  width: 100%;
+  height: auto;
+  border-radius: 6px;
+  justify-content: flex-start;
+  padding: 8px 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.toolbar-overflow-menu > button:hover:not(:disabled) {
+  background-color: var(--chip-bg);
+}
+
+.toolbar-overflow-menu > button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.toolbar-overflow-menu > button img {
+  width: 18px;
+  height: 18px;
+  opacity: 0.8;
+}
+
+.toolbar-overflow-menu > button .btn-label {
+  display: inline;
+}
+
 .settings {
   display: flex;
   flex-wrap: wrap;
@@ -699,9 +858,16 @@ label {
   opacity: 1;
 }
 
-/* ===== History Panel (slide-over drawer) ===== */
+/* ===== History Panel (slide-over drawer) =====
+   Phase 2B: panels stay mounted in the DOM at all times. They start
+   off-screen via translateX(100%) and slide in when `.open` is added.
+   visibility:hidden + aria-hidden hides them from AT and tab order
+   when off-screen. The `prefers-reduced-motion` global block at the
+   bottom of the file neutralizes the transition automatically.
+*/
 .history-panel {
-  display: none;
+  display: flex;
+  flex-direction: column;
   position: fixed;
   top: 0;
   right: 0;
@@ -711,13 +877,23 @@ label {
   background: var(--bg);
   border-left: 1px solid var(--border);
   z-index: 200;
-  flex-direction: column;
   box-shadow: -4px 0 20px rgba(0, 0, 0, 0.1);
   overflow: hidden;
+  transform: translateX(100%);
+  transition: transform 0.25s ease;
+  visibility: hidden;
 }
 
+.history-panel.open {
+  transform: translateX(0);
+  visibility: visible;
+}
+
+/* Legacy `.visible` class kept for any consumer that still toggles it;
+   it now does the same job as `.open` so nothing breaks during transition. */
 .history-panel.visible {
-  display: flex;
+  transform: translateX(0);
+  visibility: visible;
 }
 
 /* ===== History Panel Header ===== */
@@ -885,13 +1061,18 @@ label {
   padding: 40px 20px;
 }
 
-.history-panel.visible .history-empty.visible {
+.history-panel.visible .history-empty.visible,
+.history-panel.open .history-empty.visible {
   display: flex;
 }
 
-/* ===== History Detail View ===== */
+/* ===== History Detail View =====
+   Phase 2B: same slide treatment as .history-panel. Higher z-index so it
+   sits over the panel.
+*/
 .history-detail {
-  display: none;
+  display: flex;
+  flex-direction: column;
   position: fixed;
   top: 0;
   right: 0;
@@ -901,13 +1082,21 @@ label {
   background: var(--bg);
   border-left: 1px solid var(--border);
   z-index: 210;
-  flex-direction: column;
   box-shadow: -4px 0 20px rgba(0, 0, 0, 0.1);
   overflow: hidden;
+  transform: translateX(100%);
+  transition: transform 0.25s ease;
+  visibility: hidden;
+}
+
+.history-detail.open {
+  transform: translateX(0);
+  visibility: visible;
 }
 
 .history-detail.visible {
-  display: flex;
+  transform: translateX(0);
+  visibility: visible;
 }
 
 .history-detail-header {
@@ -1164,6 +1353,229 @@ html.is-extension .history-detail {
 
 .retranscribe-result p {
   margin: 0 0 8px 0;
+}
+
+/* ===== Phase 2B: Backdrop dim layer ===== */
+.panel-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0);
+  pointer-events: none;
+  z-index: 190; /* below .history-panel (200) and .history-detail (210) */
+  transition: background-color 0.2s ease;
+}
+
+.panel-backdrop[hidden] {
+  display: none;
+}
+
+.panel-backdrop.open {
+  background: rgba(0, 0, 0, 0.35);
+  pointer-events: auto;
+}
+
+/* ===== Phase 2B: Toast deck + toast cards ===== */
+.toast-deck {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 420px;
+  z-index: 1000;
+  pointer-events: none; /* deck itself doesn't intercept; toasts do */
+}
+
+@media (max-width: 480px) {
+  /* Mobile / extension: stretch full-width and bottom-center via padding. */
+  .toast-deck {
+    left: 16px;
+    right: 16px;
+    max-width: none;
+  }
+}
+
+html.is-extension .toast-deck {
+  left: 16px;
+  right: 16px;
+  max-width: none;
+}
+
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  font-size: 13px;
+  line-height: 1.4;
+  animation: toast-slide-in 0.2s ease-out;
+}
+
+@keyframes toast-slide-in {
+  from {
+    transform: translateY(8px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.toast--info {
+  border-left: 3px solid #1976d2;
+}
+
+.toast--success {
+  border-left: 3px solid #2e7d32;
+}
+
+.toast--warn {
+  border-left: 3px solid #ed6c02;
+}
+
+.toast--error {
+  border-left: 3px solid #d32f2f;
+}
+
+.toast-message {
+  flex: 1;
+  word-break: break-word;
+}
+
+.toast-action {
+  background: transparent;
+  border: 1px solid var(--button-border);
+  color: var(--text);
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.toast-action:hover {
+  background: var(--chip-bg);
+}
+
+.toast-close {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.toast-close:hover {
+  color: var(--text);
+}
+
+/* ===== Phase 2B: Compact-header mode (Q1: default ON) =====
+   Engaged after 30s of recording; pin button toggles
+   `html.compact-header-pinned-off` which suppresses it.
+   When the user has explicitly pinned compact-mode OFF, the
+   pinned-off rule wins via specificity (`html.compact-header-pinned-off`).
+*/
+html.compact-header.compact-header-pinned-off .header-container,
+html.compact-header.compact-header-pinned-off #recordButton,
+html.compact-header.compact-header-pinned-off .header-button,
+html.compact-header.compact-header-pinned-off .copy-button,
+html.compact-header.compact-header-pinned-off .settings-toggle,
+html.compact-header.compact-header-pinned-off .compact-pin-btn,
+html.compact-header.compact-header-pinned-off .toolbar-overflow-btn {
+  /* No-op overrides — restoring full size happens by NOT applying the
+     compact rules below. The selectors above just exist to make the
+     "pin engaged" state explicit and discoverable in DevTools. */
+}
+
+html.compact-header:not(.compact-header-pinned-off) .header-container {
+  padding: 8px 12px;
+}
+
+html.compact-header:not(.compact-header-pinned-off) .header-container #status {
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+html.compact-header:not(.compact-header-pinned-off) #recordButton {
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  padding: 0;
+}
+
+html.compact-header:not(.compact-header-pinned-off) #recordButton .recording-info {
+  display: none;
+}
+
+html.compact-header:not(.compact-header-pinned-off) #recordButton .shape-container {
+  width: 14px;
+  height: 14px;
+}
+
+html.compact-header:not(.compact-header-pinned-off) .copy-button,
+html.compact-header:not(.compact-header-pinned-off) .header-button:not(.toolbar-overflow-menu > .header-button),
+html.compact-header:not(.compact-header-pinned-off) .settings-toggle,
+html.compact-header:not(.compact-header-pinned-off) .compact-pin-btn,
+html.compact-header:not(.compact-header-pinned-off) .toolbar-overflow-btn {
+  width: 30px;
+  height: 30px;
+}
+
+html.compact-header:not(.compact-header-pinned-off) .copy-button img,
+html.compact-header:not(.compact-header-pinned-off) .header-button img,
+html.compact-header:not(.compact-header-pinned-off) .settings-toggle img,
+html.compact-header:not(.compact-header-pinned-off) .compact-pin-btn img {
+  width: 16px;
+  height: 16px;
+}
+
+html.compact-header:not(.compact-header-pinned-off) .header-button .btn-label {
+  display: none;
+}
+
+/* ===== Phase 2B: Responsive density rules =====
+   Desktop (≥ 768 px): all groups inline (default — no overrides needed).
+   Tablet (480–767 px): collapse Tools group into ⋯ overflow.
+   Mobile / extension (≤ 480 px or .is-extension): collapse Session AND
+   Tools into ⋯ overflow; only Primary + ⋯ + Settings remain inline.
+
+   The actual relocation of buttons is done by JS at runtime via
+   reparenting (see `setupToolbarOverflow` in live_transcription.js).
+   These media queries exist to (a) reveal the ⋯ button at the right
+   widths and (b) hide any group that has been emptied by JS.
+*/
+@media (max-width: 767px) {
+  .toolbar-overflow {
+    display: flex;
+  }
+  /* When a group is emptied by JS reparenting, .toolbar-group:empty
+     already hides it (rule above). We still need to remove its border
+     separator on the next group, which `:empty + .toolbar-group` would
+     handle naturally. No explicit rule needed. */
+}
+
+@media (max-width: 480px) {
+  /* Mobile-specific tweaks layered on top of the tablet rules. The
+     overflow button stays visible; the ⋯ menu now contains
+     Session + Tools. Header may wrap to two rows naturally because
+     `.toolbar` has `flex-wrap: wrap`. */
+  .toolbar {
+    gap: 8px;
+  }
+}
+
+/* Extension mode follows the mobile rules irrespective of pixel width. */
+html.is-extension .toolbar-overflow {
+  display: flex;
 }
 
 /*
