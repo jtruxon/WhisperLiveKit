@@ -37,8 +37,16 @@ def get_inline_ui_html():
             worklet_code = f.read()
         with resources.files('whisperlivekit.web').joinpath('recorder_worker.js').open('r', encoding='utf-8') as f:
             worker_code = f.read()
-        with resources.files('whisperlivekit.web').joinpath('mp3_encoder_worker.js').open('r', encoding='utf-8') as f:
-            encoder_worker_code = f.read()
+        # Phase 2D-1: the encoder worker was renamed to audio_encoder_worker.js
+        # (it emits WAV; real MP3 is deferred to 2D-2). The legacy path
+        # mp3_encoder_worker.js is now a deprecation shim on disk that this
+        # rewriter intentionally bypasses. To stay back-compat with any cached
+        # JS still referencing the legacy path, BOTH '/web/mp3_encoder_worker.js'
+        # AND '/web/audio_encoder_worker.js' are rewritten to the SAME Blob URL
+        # backed by audio_encoder_worker.js. Drop the legacy substring + this
+        # comment in Phase 2D-3. See PHASE2_UI_DESIGN.md §9.3.
+        with resources.files('whisperlivekit.web').joinpath('audio_encoder_worker.js').open('r', encoding='utf-8') as f:
+            audio_worker_js = f.read()
 
         js_content = js_content.replace(
             'await audioContext.audioWorklet.addModule("/web/pcm_worklet.js");',
@@ -52,11 +60,28 @@ def get_inline_ui_html():
             'const workerUrl = URL.createObjectURL(workerBlob);\n' +
             'recorderWorker = new Worker(workerUrl);'
         )
+        # Phase 2D-1: replace BOTH the canonical and the legacy encoder-worker
+        # path substrings with the SAME Blob URL backed by audio_encoder_worker.js.
+        # The Blob URL is defined once at the top of the inlined JS so both
+        # substring substitutions can reference it. Drop the legacy substitution
+        # in Phase 2D-3. See PHASE2_UI_DESIGN.md §9.3.
+        audio_encoder_prelude = (
+            'const audioEncoderBlob = new Blob([`' + audio_worker_js + '`], '
+            '{ type: "application/javascript" });\n'
+            'const audioEncoderUrl = URL.createObjectURL(audioEncoderBlob);\n'
+        )
+        js_content = audio_encoder_prelude + js_content
+        # New canonical path → Blob URL.
         js_content = js_content.replace(
-            'mp3EncoderWorker = new Worker("/web/mp3_encoder_worker.js");',
-            'const encoderBlob = new Blob([`' + encoder_worker_code + '`], { type: "application/javascript" });\n' +
-            'const encoderUrl = URL.createObjectURL(encoderBlob);\n' +
-            'mp3EncoderWorker = new Worker(encoderUrl);'
+            '"/web/audio_encoder_worker.js"',
+            'audioEncoderUrl',
+        )
+        # Legacy path (pre-2D-1) → same Blob URL. Back-compat hook for any
+        # cached/served JS still referring to '/web/mp3_encoder_worker.js'.
+        # Drop this line in Phase 2D-3.
+        js_content = js_content.replace(
+            '"/web/mp3_encoder_worker.js"',
+            'audioEncoderUrl',
         )
 
         # SVG files
@@ -92,6 +117,12 @@ def get_inline_ui_html():
         with resources.files('whisperlivekit.web').joinpath('src', 'arrow_back.svg').open('r', encoding='utf-8') as f:
             arrow_back_svg = f.read()
             arrow_back_uri = f"data:image/svg+xml;base64,{base64.b64encode(arrow_back_svg.encode('utf-8')).decode('utf-8')}"
+
+        # Phase 2B: pin icon for the compact-header toggle in the toolbar's
+        # trailing group. Inlined the same way as the other Phase 2A icons.
+        with resources.files('whisperlivekit.web').joinpath('src', 'pin.svg').open('r', encoding='utf-8') as f:
+            pin_svg = f.read()
+            pin_uri = f"data:image/svg+xml;base64,{base64.b64encode(pin_svg.encode('utf-8')).decode('utf-8')}"
 
         # Replace external references
         html_content = html_content.replace(
@@ -169,6 +200,9 @@ def get_inline_ui_html():
         # Also replace SVG references in the inlined JS (used in renderHistoryList template literals)
         html_content = _inline_svg_in_text(html_content, "clipboard.svg", clipboard_uri)
         html_content = _inline_svg_in_text(html_content, "trash.svg", trash_uri)
+        # Phase 2B: pin icon — only referenced once in HTML today, but routed
+        # through the helper for consistency in case it shows up in dynamic JS.
+        html_content = _inline_svg_in_text(html_content, "pin.svg", pin_uri)
 
         return html_content
 

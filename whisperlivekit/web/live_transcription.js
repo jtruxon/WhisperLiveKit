@@ -33,7 +33,7 @@ let outputAudioContext = null;
 let audioSource = null;
 
 // --- History & Audio Recording ---
-let mp3EncoderWorker = null;
+let audioEncoderWorker = null;
 let pendingAudioSave = null;
 let recordingStartTime = null;
 let webmChunksForHistory = [];
@@ -796,11 +796,11 @@ async function startRecording() {
 
     // Initialize MP3/WAV encoder worker for history recording
     try {
-      mp3EncoderWorker = new Worker("/web/mp3_encoder_worker.js");
-      mp3EncoderWorker.postMessage({ command: 'init', sampleRate: audioContext.sampleRate });
+      audioEncoderWorker = new Worker("/web/audio_encoder_worker.js");
+      audioEncoderWorker.postMessage({ command: 'init', sampleRate: audioContext.sampleRate });
     } catch (encErr) {
       console.warn('Could not initialize encoder worker:', encErr);
-      mp3EncoderWorker = null;
+      audioEncoderWorker = null;
     }
 
     if (serverUseAudioWorklet) {
@@ -830,9 +830,9 @@ async function startRecording() {
         const ab = data instanceof ArrayBuffer ? data : data.buffer;
 
         // Fork: copy buffer for WAV encoding (before transfer neuters it)
-        if (mp3EncoderWorker) {
+        if (audioEncoderWorker) {
           const copy = ab.slice(0);
-          mp3EncoderWorker.postMessage({ command: 'encode', buffer: copy }, [copy]);
+          audioEncoderWorker.postMessage({ command: 'encode', buffer: copy }, [copy]);
         }
 
         recorderWorker.postMessage(
@@ -914,14 +914,15 @@ async function stopRecording() {
   }
 
   // Flush the encoder worker for AudioWorklet path
-  if (mp3EncoderWorker && serverUseAudioWorklet) {
+  if (audioEncoderWorker && serverUseAudioWorklet) {
     pendingAudioSave = new Promise((resolve) => {
-      mp3EncoderWorker.onmessage = (ev) => {
-        if (ev.data && ev.data.type === 'mp3') {
+      audioEncoderWorker.onmessage = (ev) => {
+        // Accept legacy 'mp3' type from cached pre-2D-1 worker; remove in 2D-3.
+        if (ev.data && (ev.data.type === 'audio' || ev.data.type === 'mp3')) {
           resolve({ blob: ev.data.blob, duration: recordingDuration });
         }
       };
-      mp3EncoderWorker.postMessage({ command: 'flush' });
+      audioEncoderWorker.postMessage({ command: 'flush' });
     });
   }
 
@@ -1038,9 +1039,9 @@ async function saveRecordingToHistory() {
     console.log('Recording saved to history:', id);
 
     // Clean up encoder worker
-    if (mp3EncoderWorker) {
-      mp3EncoderWorker.terminate();
-      mp3EncoderWorker = null;
+    if (audioEncoderWorker) {
+      audioEncoderWorker.terminate();
+      audioEncoderWorker = null;
     }
 
     // Update history panel if open
@@ -1049,9 +1050,9 @@ async function saveRecordingToHistory() {
     }
   } catch (err) {
     console.warn('Failed to save recording to history:', err);
-    if (mp3EncoderWorker) {
-      mp3EncoderWorker.terminate();
-      mp3EncoderWorker = null;
+    if (audioEncoderWorker) {
+      audioEncoderWorker.terminate();
+      audioEncoderWorker = null;
     }
   }
 }
@@ -1556,7 +1557,7 @@ function updateDownloadAudioButton() {
 }
 
 function _audioFileExtensionForBlob(blob) {
-  // mp3_encoder_worker.js currently emits audio/wav; MediaRecorder path emits audio/webm.
+  // audio_encoder_worker.js currently emits audio/wav; MediaRecorder path emits audio/webm.
   // Pick the extension that matches the actual MIME so the file is playable.
   if (!blob) return "wav";
   const t = (blob.type || "").toLowerCase();
