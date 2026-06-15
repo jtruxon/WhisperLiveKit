@@ -295,6 +295,37 @@
                 <img src="src/trash.svg" alt="Clear All" width="18" height="18" />
             </button>
         </div>
+        <!-- 2C-search: search + filter region pinned above the scrolling list. -->
+        <div class="history-search-region">
+            <div class="history-search-input-wrap">
+                <input type="search"
+                       id="historySearchInput"
+                       class="history-search-input"
+                       placeholder="Search recordings…"
+                       aria-label="Search recordings"
+                       autocomplete="off"
+                       spellcheck="false" />
+                <button id="historySearchClear"
+                        class="history-search-clear"
+                        type="button"
+                        aria-label="Clear search"
+                        title="Clear search"
+                        hidden>×</button>
+            </div>
+            <details id="historySearchFilters" class="history-search-filters">
+                <summary>Filters</summary>
+                <div class="history-search-filters-row">
+                    <label class="history-filter-label">
+                        <span>From</span>
+                        <input type="date" id="historyFilterDateFrom" />
+                    </label>
+                    <label class="history-filter-label">
+                        <span>To</span>
+                        <input type="date" id="historyFilterDateTo" />
+                    </label>
+                </div>
+            </details>
+        </div>
         <div id="historyList" class="history-list">
             <!-- dynamically populated -->
         </div>
@@ -307,7 +338,12 @@
             <button id="historyDetailBack" class="history-header-btn" title="Back to list" aria-label="Back to history list">
                 <img src="src/arrow_back.svg" alt="Back" width="20" height="20" />
             </button>
-            <span id="historyDetailTitle" class="history-panel-title">Recording</span>
+            <span id="historyDetailTitle"
+                  class="history-panel-title history-detail-title-editable"
+                  role="button"
+                  tabindex="0"
+                  title="Click to rename"
+                  aria-label="Rename recording">Recording</span>
             <span></span>
         </div>
         <div class="history-player">
@@ -327,6 +363,13 @@
                 <img src="src/trash.svg" alt="Delete" width="16" height="16" />
                 <span>Delete</span>
             </button>
+        </div>
+        <!-- 2C-rename-tags: per-entry tag editor. Sits above the read-only
+             transcript; chips have × removers, the input accepts Enter or
+             comma to submit. Sanitization (lowercase, dedupe, ≤32 char,
+             ≤16 tags) lives in the JS handler. -->
+        <div id="historyDetailTagsEdit" class="history-detail-tags-edit" aria-label="Tags">
+            <!-- dynamically populated by renderHistoryDetailTags() -->
         </div>
         <div id="historyDetailTranscript" class="history-detail-transcript"></div>
     </div>

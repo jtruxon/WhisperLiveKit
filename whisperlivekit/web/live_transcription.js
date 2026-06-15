@@ -220,7 +220,125 @@ const historyStore = {
     } catch (e) {
       return [];
     }
-  }
+  },
+
+  // -------------------------------------------------------------------------
+  // update(id, fields) — Phase 2C-rename-tags writer.
+  //
+  // Reads the entry, runs _migrateEntry (so v1 entries get upgraded on first
+  // write), shallow-merges the supplied top-level fields, and persists. On
+  // any actual change, dispatches `wlk:history-updated` on `document` with
+  // `{ id, fields }` so other in-tab views (list, open detail) can refresh.
+  //
+  // Write-protected fields (cannot be changed via update — defensive delete
+  // before merge):
+  //   id, createdAt, audioRef, schemaVersion, audioMimeType
+  //
+  // Allowed fields:
+  //   userTitle, tags, speakerLabels, parentId,
+  //   lines, plainText, duration, title
+  // Anything else is ignored with a console.warn (defensive forward-compat).
+  //
+  // Idempotency: if the merge produces no observed change versus the stored
+  // entry, no write and no event dispatch occur. The promise still resolves
+  // with the (unchanged) entry so callers can chain off it uniformly.
+  // -------------------------------------------------------------------------
+  async update(id, fields) {
+    if (!id || typeof id !== 'string') {
+      console.warn('historyStore.update: invalid id', id);
+      return null;
+    }
+    if (!fields || typeof fields !== 'object') {
+      console.warn('historyStore.update: fields must be an object', fields);
+      return null;
+    }
+
+    let raw;
+    try {
+      raw = localStorage.getItem('wlk_history_' + id);
+    } catch (e) {
+      console.warn('historyStore.update: read failed', e);
+      return null;
+    }
+    if (!raw) {
+      console.warn('historyStore.update: entry not found', id);
+      return null;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      console.warn('historyStore.update: corrupt entry', id);
+      return null;
+    }
+
+    const current = _migrateEntry(parsed);
+
+    // Defensive copy — never mutate caller's object.
+    const incoming = { ...fields };
+
+    // Strip write-protected fields silently (defensive: callers must not be
+    // able to rewrite identity / immutable provenance via this helper).
+    delete incoming.id;
+    delete incoming.createdAt;
+    delete incoming.audioRef;
+    delete incoming.schemaVersion;
+    delete incoming.audioMimeType;
+
+    const ALLOWED = new Set([
+      'userTitle', 'tags', 'speakerLabels', 'parentId',
+      'lines', 'plainText', 'duration', 'title',
+    ]);
+    const accepted = {};
+    for (const key of Object.keys(incoming)) {
+      if (ALLOWED.has(key)) {
+        accepted[key] = incoming[key];
+      } else {
+        console.warn('historyStore.update: ignoring unsupported field', key);
+      }
+    }
+
+    // Idempotency: if every accepted field already deep-equals the current
+    // value, do nothing. JSON-stringify is fine here — entries are small
+    // (≤ ~50 KB plainText), and the fields we accept are JSON-safe.
+    let changed = false;
+    for (const key of Object.keys(accepted)) {
+      if (JSON.stringify(current[key]) !== JSON.stringify(accepted[key])) {
+        changed = true;
+        break;
+      }
+    }
+    if (!changed) {
+      return current;
+    }
+
+    const merged = { ...current, ...accepted };
+    // _migrateEntry is idempotent on a v2 entry but defensively re-run so
+    // schemaVersion stays normalized even if a future caller mutates it.
+    const next = _migrateEntry(merged);
+
+    try {
+      localStorage.setItem('wlk_history_' + id, JSON.stringify(next));
+    } catch (e) {
+      // Quota / serialization failure — surface but don't throw. 2C-quota
+      // owns the eviction path; we just log here.
+      console.warn('historyStore.update: write failed', e);
+      return current;
+    }
+
+    try {
+      document.dispatchEvent(new CustomEvent('wlk:history-updated', {
+        detail: { id, fields: accepted },
+      }));
+    } catch (e) {
+      // CustomEvent is supported everywhere we care about, but be defensive
+      // — failure to dispatch must not break the data write.
+      console.warn('historyStore.update: event dispatch failed', e);
+    }
+
+    return next;
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -1790,6 +1908,73 @@ function initHistoryPanel() {
   if (historyClearAll) {
     historyClearAll.addEventListener('click', clearAllHistory);
   }
+
+  // ===== 2C-search: search input + filter wiring =====
+  const historySearchInput = document.getElementById('historySearchInput');
+  const historySearchClear = document.getElementById('historySearchClear');
+  const historyFilterDateFrom = document.getElementById('historyFilterDateFrom');
+  const historyFilterDateTo = document.getElementById('historyFilterDateTo');
+
+  // Restore the persisted query (sessionStorage — refresh keeps it, new tab
+  // doesn't — per the locked decision in this task's scope).
+  if (historySearchInput) {
+    let restored = '';
+    try { restored = sessionStorage.getItem('wlk_history_search') || ''; } catch (e) { /* ignore */ }
+    if (restored) {
+      historySearchInput.value = restored;
+      if (historySearchClear) historySearchClear.hidden = false;
+    }
+  }
+
+  // 150 ms debounce — design §4.2 budget. Stored on the function for reuse.
+  let _searchDebounceTimer = null;
+  function _scheduleSearchRender() {
+    if (_searchDebounceTimer !== null) clearTimeout(_searchDebounceTimer);
+    _searchDebounceTimer = setTimeout(() => {
+      _searchDebounceTimer = null;
+      renderHistoryList();
+    }, 150);
+  }
+
+  if (historySearchInput) {
+    historySearchInput.addEventListener('input', () => {
+      const v = historySearchInput.value || '';
+      _setSearchQuery(v);
+      if (historySearchClear) historySearchClear.hidden = v.length === 0;
+      _scheduleSearchRender();
+    });
+    // Pressing Escape inside the field clears it (matches type=search UX).
+    historySearchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && historySearchInput.value) {
+        historySearchInput.value = '';
+        _setSearchQuery('');
+        if (historySearchClear) historySearchClear.hidden = true;
+        _scheduleSearchRender();
+        e.stopPropagation();
+      }
+    });
+  }
+
+  if (historySearchClear) {
+    historySearchClear.addEventListener('click', () => {
+      if (historySearchInput) historySearchInput.value = '';
+      _setSearchQuery('');
+      historySearchClear.hidden = true;
+      if (historySearchInput) historySearchInput.focus();
+      // Clearing is immediate — skip the debounce so the user sees the full
+      // list snap back without the 150 ms wait.
+      renderHistoryList();
+    });
+  }
+
+  // Date filters: not persisted (transient session-only choice). Re-render
+  // immediately on change — date pickers don't need debounce.
+  if (historyFilterDateFrom) {
+    historyFilterDateFrom.addEventListener('change', renderHistoryList);
+  }
+  if (historyFilterDateTo) {
+    historyFilterDateTo.addEventListener('change', renderHistoryList);
+  }
   if (historyDetailBack) {
     historyDetailBack.addEventListener('click', closeHistoryDetail);
   }
@@ -1815,6 +2000,13 @@ function initHistoryPanel() {
     historySeekBar.addEventListener('input', (e) => {
       seekHistoryAudio(parseFloat(e.target.value));
     });
+  }
+  // 2C-rename-tags: detail-view title rename. Click or Enter/Space activates
+  // the in-place input swap; the handler is shared between both events.
+  const historyDetailTitle = document.getElementById('historyDetailTitle');
+  if (historyDetailTitle) {
+    historyDetailTitle.addEventListener('click', _onHistoryDetailTitleActivate);
+    historyDetailTitle.addEventListener('keydown', _onHistoryDetailTitleActivate);
   }
 }
 
@@ -1862,20 +2054,128 @@ function closeHistoryPanel() {
   currentHistoryDetailId = null;
 }
 
+// ===========================================================================
+// 2C-search: post-filter layer applied AFTER historyStore.list().
+//
+// The store module is intentionally NOT modified. Filtering is a UI concern,
+// so the consumer applies it. Free-text matches against:
+//   - entry.userTitle || entry.title
+//   - entry.tags joined with ' '
+//   - entry.plainText
+// (Per-line scan of entry.lines[] is explicitly Q12-deferred.)
+//
+// Date filters apply to entry.createdAt against UI-supplied yyyy-mm-dd
+// strings. dateFrom is start-of-day local, dateTo is end-of-day local
+// (inclusive). Empty strings disable that bound. Order is preserved — the
+// store already returns most-recent-first, this layer must not re-sort.
+// ===========================================================================
+function _filterEntries(entries, query, dateFrom, dateTo) {
+  if (!Array.isArray(entries)) return [];
+  const q = (query || '').trim().toLowerCase();
+
+  let fromTs = null;
+  let toTs = null;
+  if (dateFrom) {
+    const d = new Date(dateFrom + 'T00:00:00');
+    if (!isNaN(d.getTime())) fromTs = d.getTime();
+  }
+  if (dateTo) {
+    const d = new Date(dateTo + 'T23:59:59.999');
+    if (!isNaN(d.getTime())) toTs = d.getTime();
+  }
+
+  if (!q && fromTs === null && toTs === null) return entries.slice();
+
+  return entries.filter(entry => {
+    const created = typeof entry.createdAt === 'number' ? entry.createdAt : null;
+    if (fromTs !== null && (created === null || created < fromTs)) return false;
+    if (toTs !== null && (created === null || created > toTs)) return false;
+    if (!q) return true;
+
+    const title = (entry.userTitle || entry.title || '').toLowerCase();
+    if (title.indexOf(q) !== -1) return true;
+    const tags = Array.isArray(entry.tags) ? entry.tags.join(' ').toLowerCase() : '';
+    if (tags && tags.indexOf(q) !== -1) return true;
+    const pt = (entry.plainText || '').toLowerCase();
+    if (pt && pt.indexOf(q) !== -1) return true;
+    return false;
+  });
+}
+
+// Escape user-supplied query for use inside a RegExp. Required because the
+// query may contain regex metacharacters and we do NOT want them interpreted.
+function _escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Build a highlighted HTML string. Input `text` is unescaped user content; we
+// escape it first, THEN inject <mark> tags around case-insensitive matches of
+// `query`. Never accepts user content as innerHTML directly.
+function _highlightSearchHit(text, query) {
+  const safe = escapeHtml(text == null ? '' : String(text));
+  const q = (query || '').trim();
+  if (!q) return safe;
+  // Escape query for regex AND for HTML — escapeHtml ensures e.g. `<script>`
+  // typed in the search box doesn't slip into the DOM via the regex pattern.
+  const escapedForRegex = _escapeRegExp(escapeHtml(q));
+  if (!escapedForRegex) return safe;
+  let re;
+  try {
+    re = new RegExp(escapedForRegex, 'gi');
+  } catch (e) {
+    return safe;
+  }
+  return safe.replace(re, m => `<mark class="history-search-hit">${m}</mark>`);
+}
+
+// Read/write the persisted search query. Sessionscoped per Q-locked decision.
+function _getSearchState() {
+  let query = '';
+  try { query = sessionStorage.getItem('wlk_history_search') || ''; } catch (e) { /* ignore */ }
+  const fromEl = document.getElementById('historyFilterDateFrom');
+  const toEl = document.getElementById('historyFilterDateTo');
+  return {
+    query,
+    dateFrom: fromEl ? fromEl.value : '',
+    dateTo: toEl ? toEl.value : '',
+  };
+}
+
+function _setSearchQuery(query) {
+  try {
+    if (query) sessionStorage.setItem('wlk_history_search', query);
+    else sessionStorage.removeItem('wlk_history_search');
+  } catch (e) { /* sessionStorage may be unavailable; persistence is best-effort */ }
+}
+
 function renderHistoryList() {
   const listEl = document.getElementById('historyList');
   const emptyEl = document.querySelector('.history-empty');
   if (!listEl) return;
 
-  const entries = historyStore.list();
+  const allEntries = historyStore.list();
+  const { query, dateFrom, dateTo } = _getSearchState();
+  const hasFilter = !!(query || dateFrom || dateTo);
+  const entries = _filterEntries(allEntries, query, dateFrom, dateTo);
 
   if (entries.length === 0) {
     listEl.innerHTML = '';
-    if (emptyEl) emptyEl.classList.add('visible');
+    if (emptyEl) {
+      // Swap empty-state copy depending on whether the empty result is "no
+      // entries at all" vs "filter eliminated everything". Reverts to the
+      // default text when the user clears the query.
+      emptyEl.textContent = hasFilter && allEntries.length > 0
+        ? 'No matches.'
+        : 'No recordings yet';
+      emptyEl.classList.add('visible');
+    }
     return;
   }
 
-  if (emptyEl) emptyEl.classList.remove('visible');
+  if (emptyEl) {
+    emptyEl.classList.remove('visible');
+    emptyEl.textContent = 'No recordings yet';
+  }
 
   listEl.innerHTML = entries.map(entry => {
     const dateStr = new Date(entry.createdAt).toLocaleString(undefined, {
@@ -1884,14 +2184,33 @@ function renderHistoryList() {
     const durMin = Math.floor((entry.duration || 0) / 60);
     const durSec = (entry.duration || 0) % 60;
     const durStr = durMin + ':' + durSec.toString().padStart(2, '0');
-    const preview = (entry.plainText || '').substring(0, 120) || 'No transcript';
+    const previewSrc = (entry.plainText || '').substring(0, 120) || 'No transcript';
+    const titleSrc = entry.userTitle || entry.title || dateStr;
+
+    // _highlightSearchHit handles HTML-escaping internally before wrapping
+    // matches in <mark class="history-search-hit">. Compatible with
+    // 2C-rename-tags' tag-chip block (which appends a separate
+    // <div class="history-item-tags"> sibling and does not collide
+    // structurally with the title/preview spans).
+    const titleHtml = _highlightSearchHit(titleSrc, query);
+    const previewHtml = _highlightSearchHit(previewSrc, query);
+
+    // 2C-rename-tags: read-only tag pills under the preview. Rendered as a
+    // separate sibling block so 2C-search's <mark> wrapping in the title
+    // and preview spans is untouched. Empty tags array → emit nothing.
+    const tagsHtml = (Array.isArray(entry.tags) && entry.tags.length > 0)
+      ? `<div class="history-item-tags">${entry.tags.map(t =>
+          `<span class="history-item-tag">${escapeHtml(t)}</span>`
+        ).join('')}</div>`
+      : '';
 
     return `<div class="history-item" data-id="${entry.id}">
       <div class="history-item-header">
-        <span class="history-item-title">${escapeHtml(entry.title || dateStr)}</span>
+        <span class="history-item-title">${titleHtml}</span>
         <span class="history-item-duration">${durStr}</span>
       </div>
-      <div class="history-item-preview">${escapeHtml(preview)}</div>
+      <div class="history-item-preview">${previewHtml}</div>
+      ${tagsHtml}
       <div class="history-item-actions">
         <button class="history-item-btn history-item-copy" title="Copy transcript" data-id="${entry.id}">
           <img src="src/clipboard.svg" alt="Copy" width="16" height="16" />
@@ -1942,27 +2261,20 @@ function getHistoryEntry(id) {
 
 async function openHistoryDetail(id) {
   const detail = document.getElementById('historyDetail');
-  const titleEl = document.getElementById('historyDetailTitle');
-  const transcriptEl = document.getElementById('historyDetailTranscript');
   if (!detail) return;
 
   currentHistoryDetailId = id;
   const entry = getHistoryEntry(id);
   if (!entry) return;
 
-  if (titleEl) titleEl.textContent = entry.title || 'Recording';
+  // Title (userTitle takes precedence over auto title — locked decision §4.1).
+  _renderHistoryDetailTitle(entry);
 
-  // Render transcript
-  if (transcriptEl) {
-    if (entry.lines && entry.lines.length > 0) {
-      transcriptEl.innerHTML = entry.lines
-        .filter(line => line.speaker !== -2 && line.speaker !== 0)
-        .map(line => `<p>${escapeHtml(line.text || '')}</p>`)
-        .join('');
-    } else {
-      transcriptEl.innerHTML = `<p>${escapeHtml(entry.plainText || 'No transcript')}</p>`;
-    }
-  }
+  // Tag editor (chips + Add-tag input).
+  _renderHistoryDetailTags(entry);
+
+  // Transcript with speaker chips (clickable to rename — except silence -2).
+  _renderHistoryDetailTranscript(entry);
 
   // Reset player state
   const seekBar = document.getElementById('historySeekBar');
@@ -1980,6 +2292,345 @@ async function openHistoryDetail(id) {
   detail.setAttribute('aria-hidden', 'false');
   OverlayManager.push('historyDetail');
 }
+
+// ===========================================================================
+// 2C-rename-tags helpers — detail-view rendering for editable title, tags,
+// and speaker-chip rename. All persistence routes through historyStore.update
+// so the wlk:history-updated event keeps the list view in sync.
+// ===========================================================================
+
+const HISTORY_TAGS_MAX = 16;
+const HISTORY_TAG_LEN_MAX = 32;
+
+// Render the detail-view title. The element is a span styled like a button.
+// Click (or Enter/Space) swaps it with an <input>. Enter saves, Esc reverts,
+// blur saves. Empty input clears userTitle (restoring the auto title).
+function _renderHistoryDetailTitle(entry) {
+  const titleEl = document.getElementById('historyDetailTitle');
+  if (!titleEl) return;
+  const display = entry.userTitle || entry.title || 'Recording';
+  titleEl.textContent = display;
+  titleEl.dataset.entryId = entry.id;
+}
+
+// Click/keyboard handler attached once at init. Lazy-attaches because the
+// detail view is shared across entries.
+function _onHistoryDetailTitleActivate(ev) {
+  const titleEl = ev.currentTarget;
+  if (!titleEl || titleEl.classList.contains('editing')) return;
+  if (ev.type === 'keydown' && ev.key !== 'Enter' && ev.key !== ' ') return;
+  if (ev.type === 'keydown') ev.preventDefault();
+
+  const id = titleEl.dataset.entryId || currentHistoryDetailId;
+  if (!id) return;
+  const entry = getHistoryEntry(id);
+  if (!entry) return;
+
+  const original = titleEl.textContent;
+  // userTitle drives the input value; if absent, prefill with the auto title
+  // so the user can edit-from-current rather than start blank.
+  const seed = entry.userTitle || entry.title || '';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'history-detail-title-input';
+  input.value = seed;
+  input.maxLength = 200;
+  input.setAttribute('aria-label', 'Rename recording');
+
+  titleEl.classList.add('editing');
+  titleEl.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let finished = false;
+  const restore = (text) => {
+    if (finished) return;
+    finished = true;
+    titleEl.textContent = text;
+    titleEl.classList.remove('editing');
+    input.replaceWith(titleEl);
+  };
+
+  const commit = async () => {
+    const raw = (input.value || '').trim();
+    // Empty → clear userTitle (locked decision §4.1: empty restores auto).
+    const nextUserTitle = raw === '' ? null : raw.slice(0, 200);
+    // Optimistic restore so blur/click ordering doesn't leave a phantom input.
+    const cur = getHistoryEntry(id);
+    const fallback = (cur && (nextUserTitle || cur.title)) || original;
+    restore(nextUserTitle || (cur && cur.title) || original);
+    await historyStore.update(id, { userTitle: nextUserTitle });
+    // Re-render tags + transcript headers in case anything depends on title;
+    // event listener handles the list-view refresh.
+    void fallback;
+  };
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      restore(original);
+    }
+  });
+  input.addEventListener('blur', () => {
+    if (!finished) commit();
+  });
+}
+
+function _renderHistoryDetailTags(entry) {
+  const wrap = document.getElementById('historyDetailTagsEdit');
+  if (!wrap) return;
+  const tags = Array.isArray(entry.tags) ? entry.tags : [];
+
+  const chipsHtml = tags.map((t, i) =>
+    `<span class="history-detail-tag-chip" data-idx="${i}">
+       <span class="history-detail-tag-text">${escapeHtml(t)}</span>
+       <button type="button" class="history-detail-tag-remove"
+               data-idx="${i}" aria-label="Remove tag ${escapeHtml(t)}"
+               title="Remove tag">×</button>
+     </span>`
+  ).join('');
+
+  wrap.innerHTML = `
+    ${chipsHtml}
+    <input type="text"
+           class="history-detail-tag-input"
+           id="historyDetailTagInput"
+           placeholder="Add tag…"
+           maxlength="${HISTORY_TAG_LEN_MAX}"
+           aria-label="Add tag" />
+  `;
+  wrap.dataset.entryId = entry.id;
+
+  wrap.querySelectorAll('.history-detail-tag-remove').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const idx = parseInt(btn.dataset.idx, 10);
+      _removeHistoryTagAt(entry.id, idx);
+    });
+  });
+
+  const input = wrap.querySelector('#historyDetailTagInput');
+  if (input) {
+    const submit = () => {
+      const val = input.value;
+      input.value = '';
+      _addHistoryTag(entry.id, val);
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ',') {
+        e.preventDefault();
+        submit();
+      }
+    });
+    input.addEventListener('blur', () => {
+      // Submit on blur only if there's content; avoids surprise submission
+      // when the user clicks elsewhere with an empty input.
+      if (input.value.trim()) submit();
+    });
+  }
+}
+
+// Tag sanitization: lowercase, trim, collapse whitespace, ≤32 char per tag,
+// dedupe, ≤16 tags per entry. Reject empties.
+function _sanitizeTag(raw) {
+  if (typeof raw !== 'string') return '';
+  let t = raw.toLowerCase().trim().replace(/\s+/g, ' ');
+  if (!t) return '';
+  if (t.length > HISTORY_TAG_LEN_MAX) t = t.slice(0, HISTORY_TAG_LEN_MAX);
+  return t;
+}
+
+async function _addHistoryTag(id, raw) {
+  const entry = getHistoryEntry(id);
+  if (!entry) return;
+  const cur = Array.isArray(entry.tags) ? entry.tags.slice() : [];
+  // Comma-separated input is allowed (the keydown handler also catches `,`,
+  // but a paste of "a, b, c" should still split into three).
+  const candidates = String(raw || '').split(',').map(_sanitizeTag).filter(Boolean);
+  if (candidates.length === 0) return;
+  let changed = false;
+  for (const tag of candidates) {
+    if (cur.length >= HISTORY_TAGS_MAX) break;
+    if (!cur.includes(tag)) {
+      cur.push(tag);
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  await historyStore.update(id, { tags: cur });
+}
+
+async function _removeHistoryTagAt(id, idx) {
+  const entry = getHistoryEntry(id);
+  if (!entry) return;
+  const cur = Array.isArray(entry.tags) ? entry.tags.slice() : [];
+  if (idx < 0 || idx >= cur.length) return;
+  cur.splice(idx, 1);
+  await historyStore.update(id, { tags: cur });
+}
+
+// Render the detail transcript. Each non-silence/non-zero line gets a
+// clickable speaker chip ahead of its text. Speaker -2 (silence, server
+// invariant per AGENTS.md / Segment.to_dict) is excluded from rename — and
+// already filtered out of the rendered set entirely.
+function _renderHistoryDetailTranscript(entry) {
+  const transcriptEl = document.getElementById('historyDetailTranscript');
+  if (!transcriptEl) return;
+
+  if (!entry.lines || entry.lines.length === 0) {
+    transcriptEl.innerHTML = `<p>${escapeHtml(entry.plainText || 'No transcript')}</p>`;
+    return;
+  }
+
+  const labels = (entry.speakerLabels && typeof entry.speakerLabels === 'object')
+    ? entry.speakerLabels : {};
+
+  const html = entry.lines
+    .filter(line => line.speaker !== -2 && line.speaker !== 0)
+    .map(line => {
+      const sid = String(line.speaker);
+      const labelText = labels[sid] || ('S' + sid);
+      // Speaker -2 already filtered above; this guard is belt-and-braces in
+      // case the line array somehow surfaces silence (and to make the
+      // intent explicit when reading the code).
+      const isRenamable = line.speaker !== -2;
+      const chipAttrs = isRenamable
+        ? `class="history-detail-speaker-chip" data-speaker-id="${escapeHtml(sid)}" role="button" tabindex="0" title="Click to rename speaker"`
+        : `class="history-detail-speaker-chip history-detail-speaker-chip-locked"`;
+      return `<p class="history-detail-line">
+        <span ${chipAttrs}>${escapeHtml(labelText)}</span>
+        <span class="history-detail-line-text">${escapeHtml(line.text || '')}</span>
+      </p>`;
+    })
+    .join('');
+  transcriptEl.innerHTML = html;
+  transcriptEl.dataset.entryId = entry.id;
+
+  transcriptEl.querySelectorAll('.history-detail-speaker-chip[role="button"]').forEach(chip => {
+    chip.addEventListener('click', (e) => {
+      e.preventDefault();
+      _beginSpeakerChipRename(chip);
+    });
+    chip.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        _beginSpeakerChipRename(chip);
+      }
+    });
+  });
+}
+
+function _beginSpeakerChipRename(chip) {
+  if (!chip || chip.classList.contains('editing')) return;
+  const sid = chip.dataset.speakerId;
+  const id = currentHistoryDetailId;
+  if (!sid || !id) return;
+  // Silence sentinel guard (-2) — never reachable today (filtered out of the
+  // rendered set + chip lacks role=button) but defensive.
+  if (sid === '-2') return;
+
+  const entry = getHistoryEntry(id);
+  if (!entry) return;
+
+  const labels = (entry.speakerLabels && typeof entry.speakerLabels === 'object')
+    ? entry.speakerLabels : {};
+  const seed = labels[sid] || '';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'history-detail-speaker-chip-input';
+  input.value = seed;
+  input.maxLength = 64;
+  input.setAttribute('aria-label', 'Rename speaker');
+
+  const original = chip.textContent;
+  chip.classList.add('editing');
+  chip.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let finished = false;
+  const restore = (text) => {
+    if (finished) return;
+    finished = true;
+    chip.textContent = text;
+    chip.classList.remove('editing');
+    input.replaceWith(chip);
+  };
+
+  const commit = async () => {
+    const trimmed = (input.value || '').trim().slice(0, 64);
+    const cur = getHistoryEntry(id);
+    if (!cur) {
+      restore(original);
+      return;
+    }
+    const prev = (cur.speakerLabels && typeof cur.speakerLabels === 'object')
+      ? cur.speakerLabels : {};
+    const next = { ...prev };
+    if (trimmed === '') {
+      // Empty → delete the per-entry override (restores default "S<id>").
+      delete next[sid];
+    } else {
+      next[sid] = trimmed;
+    }
+    // Optimistic restore so blur/Enter races don't leave a phantom input.
+    restore(trimmed === '' ? ('S' + sid) : trimmed);
+    await historyStore.update(id, { speakerLabels: next });
+    // Detail-only re-render so all chips for that speaker pick up the new
+    // label without disturbing scroll position much.
+    const fresh = getHistoryEntry(id);
+    if (fresh) _renderHistoryDetailTranscript(fresh);
+  };
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      restore(original);
+    }
+  });
+  input.addEventListener('blur', () => {
+    if (!finished) commit();
+  });
+}
+
+// In-tab listener: when any code path mutates an entry via historyStore.update
+// the list view (if open) refreshes, and the detail view (if open on the same
+// entry) re-syncs title + tags. Cross-tab is 2C-quota's BroadcastChannel job.
+document.addEventListener('wlk:history-updated', (ev) => {
+  const detail = ev && ev.detail;
+  if (!detail) return;
+  const id = detail.id;
+  const fields = detail.fields || {};
+
+  // List refresh — cheap; renderHistoryList tolerates being called with an
+  // empty/closed panel (it short-circuits when #historyList is missing or
+  // the list element is null).
+  try { renderHistoryList(); } catch (e) { /* non-fatal */ }
+
+  // Detail re-sync only if we're currently viewing that entry.
+  if (currentHistoryDetailId !== id) return;
+  const entry = getHistoryEntry(id);
+  if (!entry) return;
+
+  if ('userTitle' in fields || 'title' in fields) {
+    _renderHistoryDetailTitle(entry);
+  }
+  if ('tags' in fields) {
+    _renderHistoryDetailTags(entry);
+  }
+  if ('speakerLabels' in fields) {
+    _renderHistoryDetailTranscript(entry);
+  }
+});
 
 function closeHistoryDetail() {
   const detail = document.getElementById('historyDetail');
