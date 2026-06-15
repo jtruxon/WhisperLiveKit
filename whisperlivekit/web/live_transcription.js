@@ -49,12 +49,17 @@ let lastSessionAudioBlob = null;
 let lastSessionAudioStartedAt = null; // Date object for filename timestamp
 
 // --- History Store (IndexedDB + localStorage) ---
+// Bumped to v2 for Phase 2C (per-entry rename, tags, speaker labels,
+// audio mime, retranscribe parentage). See PHASE2_UI_DESIGN.md §4.1.
+const SCHEMA_VERSION = 2;
+
 const historyStore = {
   DB_NAME: 'WhisperLiveKitHistory',
   DB_VERSION: 1,
   STORE_NAME: 'audioBlobs',
   INDEX_KEY: 'wlk_history_index',
   db: null,
+  SCHEMA_VERSION,
 
   async init() {
     try {
@@ -82,11 +87,14 @@ const historyStore = {
 
   async save(entry, blob) {
     try {
+      // Always normalize to v2 on write. _migrateEntry preserves any
+      // unknown keys the caller passed through.
+      const v2Entry = _migrateEntry(entry);
       // Save metadata to localStorage
       const index = this._getIndex();
-      index.unshift(entry.id);
+      index.unshift(v2Entry.id);
       localStorage.setItem(this.INDEX_KEY, JSON.stringify(index));
-      localStorage.setItem('wlk_history_' + entry.id, JSON.stringify(entry));
+      localStorage.setItem('wlk_history_' + v2Entry.id, JSON.stringify(v2Entry));
 
       // Save audio blob to IndexedDB
       if (this.db && blob) {
@@ -94,7 +102,7 @@ const historyStore = {
           try {
             const tx = this.db.transaction(this.STORE_NAME, 'readwrite');
             const store = tx.objectStore(this.STORE_NAME);
-            store.put({ id: entry.id, blob: blob });
+            store.put({ id: v2Entry.id, blob: blob });
             tx.oncomplete = () => resolve();
             tx.onerror = () => { console.warn('IDB save error'); resolve(); };
           } catch (err) {
@@ -114,9 +122,21 @@ const historyStore = {
       const entries = [];
       for (const id of index) {
         const raw = localStorage.getItem('wlk_history_' + id);
-        if (raw) {
-          try { entries.push(JSON.parse(raw)); } catch (e) { /* skip corrupt */ }
+        if (!raw) continue;
+        let parsed;
+        try { parsed = JSON.parse(raw); } catch (e) { continue; /* skip corrupt */ }
+        const wasV2 = parsed && parsed.schemaVersion === SCHEMA_VERSION;
+        const migrated = _migrateEntry(parsed);
+        // Sticky: only write back when actual upgrade happened.
+        if (!wasV2) {
+          try {
+            localStorage.setItem('wlk_history_' + id, JSON.stringify(migrated));
+          } catch (e) {
+            // Quota / serialization failure is non-fatal for read path.
+            console.warn('historyStore.list write-back failed:', e);
+          }
         }
+        entries.push(migrated);
       }
       return entries;
     } catch (err) {
@@ -202,6 +222,43 @@ const historyStore = {
     }
   }
 };
+
+// ---------------------------------------------------------------------------
+// _migrateEntry — pure helper, idempotent, preserves unknown keys.
+//
+// Phase 2C-prep schema upgrade (PHASE2_UI_DESIGN.md §4.1). Any historic entry
+// (v1, no schemaVersion) gets the new v2-optional fields default-populated:
+//   userTitle: null, tags: [], speakerLabels: {},
+//   audioMimeType: 'audio/wav', parentId: null, schemaVersion: 2
+// Older entries had no record of mime; the encoder worker emits WAV so that's
+// the safe default for export. parentId is the retranscribe "Keep both" link
+// (§4.4). speakerLabels is per-history-entry only (locked decision Q2 — never
+// a global rename map).
+//
+// Idempotency: running on a v2 entry returns an equivalent v2 entry without
+// stripping or rewriting unknown keys (forward-compat for fields a future
+// build might add — we don't want a downgrade to silently nuke them).
+//
+// Manual regression check (no JS test runner in this repo): in the browser
+// DevTools console after one historyStore.list() call, run
+//   JSON.parse(localStorage.getItem('wlk_history_<id>'))
+// and confirm `schemaVersion: 2` plus the six new fields are present, with
+// the original v1 fields (id, title, lines, plainText, audioRef, …) intact.
+// ---------------------------------------------------------------------------
+function _migrateEntry(entry) {
+  if (!entry || typeof entry !== 'object') return entry;
+  // Spread first so unknown keys survive; explicit defaults below win only
+  // when the field is absent (`undefined`), preserving any caller-provided
+  // null/empty values intentionally.
+  const out = { ...entry };
+  if (out.userTitle === undefined) out.userTitle = null;
+  if (out.tags === undefined) out.tags = [];
+  if (out.speakerLabels === undefined) out.speakerLabels = {};
+  if (out.audioMimeType === undefined) out.audioMimeType = 'audio/wav';
+  if (out.parentId === undefined) out.parentId = null;
+  out.schemaVersion = SCHEMA_VERSION;
+  return out;
+}
 
 waveCanvas.width = 60 * (window.devicePixelRatio || 1);
 waveCanvas.height = 30 * (window.devicePixelRatio || 1);
