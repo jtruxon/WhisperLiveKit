@@ -89,3 +89,22 @@ ELSE:
 
 to finish
 ```
+
+
+# 4. Manual smoke tests
+
+### Empty-buffer placeholder render (manual smoke test)
+
+When `lines` is empty but `buffer_transcription` or `buffer_diarization` is
+non-empty (very first chunks of a session), `renderLinesWithBuffer()` synthesizes
+a placeholder line at `live_transcription.js:585-587`. Phase 1A's `joinSeparator()`
+guarantees this placeholder receives no spurious leading whitespace. There is no
+automated test for this; verify manually by:
+
+1. `uv run wlk --model tiny --language en`
+2. Open `http://localhost:8000/`, click record, speak immediately.
+3. The first visible chunk must NOT have a leading space, and there must be no
+   visible run-on between the buffer span and the (still-empty) committed text.
+
+If this regresses, the fix lives in `live_transcription.js` near the
+`joinSeparator("", anything)` call site (which must return `""`).

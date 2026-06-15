@@ -12,7 +12,7 @@
     <div class="header-container">
         <div class="settings-container">
             <div class="buttons-container">
-                <button id="recordButton">
+                <button id="recordButton" aria-label="Start or stop recording">
                     <div class="shape-container">
                         <div class="shape"></div>
                     </div>
@@ -24,11 +24,11 @@
                     </div>
                 </button>
 
-                <button id="settingsToggle" class="settings-toggle" title="Show/hide settings">
+                <button id="settingsToggle" class="settings-toggle" title="Show/hide settings" aria-label="Show or hide settings">
                     <img src="web/src/settings.svg" alt="Settings" />
                 </button>
 
-                <button id="copyTranscript" class="copy-button" title="Copy transcript to clipboard" style="display:none;">
+                <button id="copyTranscript" class="copy-button" title="Copy transcript to clipboard" aria-label="Copy transcript to clipboard" style="display:none;">
                     <img src="src/clipboard.svg" alt="Copy" width="20" height="20" />
                 </button>
 
@@ -43,7 +43,7 @@
                 </button>
                 <input id="retranscribeFileInput" type="file" accept="audio/*" style="display:none;" />
 
-                <button id="historyToggle" class="header-button history-toggle" title="Recording history">
+                <button id="historyToggle" class="header-button history-toggle" title="Recording history" aria-label="Recording history">
                     <img src="src/history.svg" alt="History" width="20" height="20" />
                 </button>
             </div>
@@ -95,7 +95,7 @@
         <div id="retranscribeSection" class="retranscribe-section" style="display:none;">
             <div class="retranscribe-section-header">
                 <span class="retranscribe-section-title">Re-transcription of <span id="retranscribeFileName"></span></span>
-                <button id="retranscribeCloseBtn" class="retranscribe-close-btn" title="Hide re-transcription result">×</button>
+                <button id="retranscribeCloseBtn" class="retranscribe-close-btn" title="Hide re-transcription result" aria-label="Hide re-transcription result">×</button>
             </div>
             <div id="retranscribeStatus" class="retranscribe-status"></div>
             <div id="retranscribeResult" class="retranscribe-result"></div>
@@ -105,11 +105,11 @@
     <!-- History Panel (slide-over drawer) -->
     <div id="historyPanel" class="history-panel">
         <div class="history-panel-header">
-            <button id="historyBack" class="history-header-btn" title="Close">
+            <button id="historyBack" class="history-header-btn" title="Close" aria-label="Close history panel">
                 <img src="src/arrow_back.svg" alt="Back" width="20" height="20" />
             </button>
             <h3 class="history-panel-title">Recording History</h3>
-            <button id="historyClearAll" class="history-header-btn" title="Clear all recordings">
+            <button id="historyClearAll" class="history-header-btn" title="Clear all recordings" aria-label="Clear all recordings">
                 <img src="src/trash.svg" alt="Clear All" width="18" height="18" />
             </button>
         </div>
@@ -122,14 +122,14 @@
     <!-- History Detail View (overlays history panel) -->
     <div id="historyDetail" class="history-detail">
         <div class="history-detail-header">
-            <button id="historyDetailBack" class="history-header-btn" title="Back to list">
+            <button id="historyDetailBack" class="history-header-btn" title="Back to list" aria-label="Back to history list">
                 <img src="src/arrow_back.svg" alt="Back" width="20" height="20" />
             </button>
             <span id="historyDetailTitle" class="history-panel-title">Recording</span>
             <span></span>
         </div>
         <div class="history-player">
-            <button id="historyPlayBtn" class="history-play-btn" title="Play/Pause">
+            <button id="historyPlayBtn" class="history-play-btn" title="Play/Pause" aria-label="Play or pause recording">
                 <img src="src/play.svg" alt="Play" width="22" height="22" class="player-icon-play" />
                 <img src="src/pause.svg" alt="Pause" width="22" height="22" class="player-icon-pause" style="display:none" />
             </button>

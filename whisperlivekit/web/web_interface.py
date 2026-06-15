@@ -4,6 +4,16 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _inline_svg_in_text(text: str, svg_filename: str, data_url: str) -> str:
+    """Replace every reference to ``src/<svg_filename>`` in the bundled text
+    with the corresponding base64 data URL. Used so SVG references inside
+    bundled JS template strings (e.g. dynamically built history items)
+    pick up the inlined images, not 404s.
+    """
+    return text.replace(f'src="src/{svg_filename}"', f'src="{data_url}"')
+
+
 def get_web_interface_html():
     """Loads the HTML for the web interface using importlib.resources."""
     try:
@@ -157,14 +167,8 @@ def get_inline_ui_html():
         )
 
         # Also replace SVG references in the inlined JS (used in renderHistoryList template literals)
-        html_content = html_content.replace(
-            'src="src/clipboard.svg"',
-            f'src="{clipboard_uri}"'
-        )
-        html_content = html_content.replace(
-            'src="src/trash.svg"',
-            f'src="{trash_uri}"'
-        )
+        html_content = _inline_svg_in_text(html_content, "clipboard.svg", clipboard_uri)
+        html_content = _inline_svg_in_text(html_content, "trash.svg", trash_uri)
 
         return html_content
 

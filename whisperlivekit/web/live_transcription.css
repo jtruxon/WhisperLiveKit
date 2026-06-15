@@ -523,12 +523,10 @@ label {
 
 .buffer_transcription {
   color: #7474748c;
-  margin-left: 4px;
 }
 
 .buffer_translation {
   color: #a0a0a0;
-  margin-left: 6px;
 }
 
 .spinner {
@@ -1166,4 +1164,21 @@ html.is-extension .history-detail {
 
 .retranscribe-result p {
   margin: 0 0 8px 0;
+}
+
+/*
+ * Phase 2A baseline: globally honor `prefers-reduced-motion`. Specific
+ * motion rules introduced by sub-phases 2B (toolbar/drawer transitions)
+ * and 2F (live-view enhancements) rely on this block being present, so
+ * do NOT delete it during future cleanups.
+ */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+        scroll-behavior: auto !important;
+    }
 }
